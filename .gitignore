@@ -1,0 +1,8 @@
+# Build output and analysis working copies. Note that .gitignore.txt, which
+# this replaces, had no effect - Git only reads a file named exactly
+# ".gitignore".
+build/
+workspace/
+
+MOD_CHANGES.md
+PROMPT.md
