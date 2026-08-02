@@ -11,7 +11,7 @@
 // Where a player can obtain the corresponding source for this build, as
 // AGPL-3.0 requires. Update this if the repository moves - it is the only
 // place the URL appears in the running program.
-#define HMD_SOURCE_URL "https://github.com/YOUR-USERNAME/how-many-dudes-multiplayer"
+#define HMD_SOURCE_URL "https://github.com/IMBRADY/HowManyDudesMultiplayer"
 
 #include "GameBridge.h"
 #include "Json.h"

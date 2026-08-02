@@ -25,6 +25,9 @@ don't need Visual Studio, or any source code. Just the built file.
 
 ## Step 1 - Install this mod
 
+- **Download `HowManyDudesMultiplayer.dll`** from the
+  [Releases page](https://github.com/IMBRADY/HowManyDudesMultiplayer/releases)
+- Put it in this folder, next to `install.bat`
 - **Double-click `install.bat`**
 - Save the **AuriePatcher.exe "C:\..."** line for later
 
@@ -117,9 +120,11 @@ Play normally. When an act ends, the mod takes over for a moment:
 2. **INJECT** - the normal enemy wave is replaced with your opponent's army.
 3. **RESOLVE** - whoever's army falls loses a life. At zero lives, that run ends.
 
-Then the next act starts and it happens again. If your friend's game crashes or
-their connection drops, the mod waits 45 seconds and then just lets the act play
-out normally - a dropped connection can't ruin your run.
+Then the next act starts and it happens again. If your friend is behind, the mod
+waits up to **5 minutes** for them to finish their act, telling you what they're
+up to while you wait, then just lets the act play out normally. If their
+connection actually drops, the match ends and your run carries on unmodded - a
+dropped connection can't ruin your run.
 
 ---
 
@@ -193,13 +198,19 @@ to connect rather than misbehave. If you update, send your friend the new file.
 
 ## For developers
 
-Requires Visual Studio 2022 Build Tools (v143, x64) and a Windows SDK.
+You don't need this to play - it's only for building the DLL yourself.
+
+Requires Visual Studio 2022 (any edition, or Build Tools) with the **Desktop
+development with C++** workload. `build.bat` finds it for you.
 
 ```
 .\build.bat            REM -> build\HowManyDudesMultiplayer.dll
 .\tests\run_tests.bat  REM offline suite: JSON, sanitiser, transport, handshake, discovery
 ```
 
-- `MOD_CHANGES.md` - full change log, design decisions, verification status
 - `discovered_mappings.json` - the game internals this mod hooks into
 - `src/Sanitize.cpp` - everything the mod refuses to trust from a peer
+
+Licensed under **AGPL-3.0** - see `LICENSE` and `NOTICE`. This is required
+rather than chosen: the DLL compiles in code from YYToolkit and Aurie, both
+AGPL-3.0.

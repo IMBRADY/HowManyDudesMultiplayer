@@ -1,0 +1,20 @@
+# Batch files MUST be CRLF. cmd.exe misparses a .bat with bare LF endings:
+# @echo off silently fails and parenthesised if-blocks break. Without this,
+# whether a clone works depends on each person's core.autocrlf setting.
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.ini text eol=crlf
+*.example text eol=crlf
+
+# Normalise source to LF in the repo; checkout follows the platform.
+*.cpp text
+*.h   text
+*.hpp text
+*.py  text
+*.md  text
+*.json text
+
+# The licence is verbatim upstream text - never touch it. Line-ending
+# rewrites would break GitHub's licence detection.
+LICENSE -text
+NOTICE  text

@@ -23,7 +23,15 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$modDll = Join-Path $projectRoot 'build\HowManyDudesMultiplayer.dll'
+
+# Where the DLL might be, in the order a player is most likely to have it.
+# A release download puts it beside install.bat; a source build puts it in
+# build\. Players are never expected to build - see the guidance below.
+$dllCandidates = @(
+    (Join-Path $projectRoot 'HowManyDudesMultiplayer.dll')
+    (Join-Path $projectRoot 'build\HowManyDudesMultiplayer.dll')
+)
+$modDll = $dllCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 
 function Write-Ok      { param($m) Write-Host "  [ok] $m" -ForegroundColor Green }
 function Write-Missing { param($m) Write-Host "  [--] $m" -ForegroundColor Yellow }
@@ -88,9 +96,19 @@ Write-Host '  How Many Dudes? - multiplayer mod installer'
 Write-Host '  -------------------------------------------'
 Write-Host ''
 
-if (-not (Test-Path $modDll)) {
-    Write-Bad 'build\HowManyDudesMultiplayer.dll is missing.'
-    Write-Host '       Run build.bat first.'
+if (-not $modDll -and -not $Detect) {
+    Write-Bad 'HowManyDudesMultiplayer.dll not found.'
+    Write-Host ''
+    Write-Host '       The mod itself is a compiled DLL and is not included in a'
+    Write-Host '       source download from GitHub. Get it from the Releases page:'
+    Write-Host ''
+    Write-Host '         https://github.com/IMBRADY/HowManyDudesMultiplayer/releases'
+    Write-Host ''
+    Write-Host '       Put HowManyDudesMultiplayer.dll in this folder, next to'
+    Write-Host '       install.bat, then run install.bat again.'
+    Write-Host ''
+    Write-Host '       (Building from source instead? Run build.bat - it needs the'
+    Write-Host '        Visual Studio C++ tools. You do not need this to play.)'
     exit 1
 }
 
@@ -183,6 +201,9 @@ else             { Write-Missing 'Game executable is NOT patched for Aurie.' }
 Write-Host ''
 
 if ($Detect) {
+    if ($modDll) { Write-Ok      "Mod DLL found: $modDll" }
+    else         { Write-Missing 'Mod DLL not found - download it from the Releases page.' }
+    Write-Host ''
     Write-Host '  -Detect: nothing was changed.'
     Write-Host ''
     exit 0

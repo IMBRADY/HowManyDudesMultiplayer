@@ -1,21 +1,66 @@
 @echo off
 REM ---------------------------------------------------------------------------
 REM Build HowManyDudesMultiplayer.dll (YYToolkit / Aurie plugin, x64).
-REM No CMake dependency - drives cl.exe directly through the VS BuildTools
-REM environment. All output lands in .\build\.
 REM
-REM The project path contains spaces, so everything below runs relative to the
-REM project root rather than passing absolute paths on the command line.
+REM PLAYERS DO NOT NEED THIS. Download the DLL from the Releases page and run
+REM install.bat. This script is for developers building from source.
+REM
+REM No CMake dependency - drives cl.exe directly through the VS environment.
+REM All output lands in .\build\.
+REM
+REM NOTE: this file must be saved with CRLF line endings. cmd.exe misparses a
+REM batch file with bare LF endings - @echo off silently fails to take effect
+REM and parenthesised if-blocks break. .gitattributes pins this.
 REM ---------------------------------------------------------------------------
 setlocal
 
-set "VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-if not exist "%VCVARS%" (
-    echo [build] ERROR: vcvars64.bat not found at "%VCVARS%".
+REM Locate the C++ toolchain. vswhere.exe ships with every VS 2017+ installer
+REM and finds any edition - BuildTools, Community, Professional, Enterprise -
+REM for any year. Hardcoding one path only ever works on the machine it was
+REM written on.
+set "VCVARS="
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+
+if exist "%VSWHERE%" (
+    for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2^>nul`) do (
+        if exist "%%i\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=%%i\VC\Auxiliary\Build\vcvars64.bat"
+    )
+)
+
+REM Fall back to the usual install locations if vswhere is absent or found
+REM nothing with the C++ workload.
+if not defined VCVARS (
+    for %%e in (BuildTools Community Professional Enterprise) do (
+        for %%y in (2022 2019) do (
+            if not defined VCVARS (
+                if exist "%ProgramFiles%\Microsoft Visual Studio\%%y\%%e\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=%ProgramFiles%\Microsoft Visual Studio\%%y\%%e\VC\Auxiliary\Build\vcvars64.bat"
+                if exist "%ProgramFiles(x86)%\Microsoft Visual Studio\%%y\%%e\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=%ProgramFiles(x86)%\Microsoft Visual Studio\%%y\%%e\VC\Auxiliary\Build\vcvars64.bat"
+            )
+        )
+    )
+)
+
+if not defined VCVARS (
+    echo [build] ERROR: no Visual Studio C++ toolchain found.
+    echo.
+    echo   This script needs the MSVC compiler. Install either:
+    echo     - Visual Studio Build Tools 2022, or
+    echo     - Visual Studio 2022 Community
+    echo   and tick the "Desktop development with C++" workload.
+    echo.
+    echo   https://visualstudio.microsoft.com/downloads/
+    echo.
+    echo   If you only want to PLAY, you do not need any of this - download
+    echo   HowManyDudesMultiplayer.dll from the Releases page instead.
     exit /b 1
 )
 
+echo [build] toolchain: "%VCVARS%"
 call "%VCVARS%" >nul 2>&1
+if errorlevel 1 (
+    echo [build] ERROR: vcvars64.bat failed to initialise the environment.
+    exit /b 1
+)
 
 cd /d "%~dp0"
 if not exist "build" mkdir "build"
