@@ -139,7 +139,7 @@ out normally - a dropped connection can't ruin your run.
 | Connects, then immediately drops | Mismatched builds, or mismatched passphrase | You must both run the **same version** of the DLL. Check `session_key` matches exactly |
 | "peer presented the wrong session key" | Passphrase mismatch | Make them identical on both machines, including spaces |
 | Acts end normally, nothing is exchanged | Not connected when the act ended | Press **F8** and check for `link=connected` |
-| Game crashes on launch | Framework version mismatch | Make sure YYToolkit is **4.0.1**. v5 breaks all v4 mods, including this one |
+| Game crashes on launch | Framework version mismatch | Make sure YYToolkit is **5.0.0c**. v5 breaks all v4 mods, including this one |
 
 **Still stuck?** Press **F8** in-game and read the console. Every line the mod
 prints starts with `[HMD-MP]`, and it says exactly which stage failed.
@@ -182,10 +182,10 @@ framework loads with the game. That's how Aurie works, it's reversible
 and it's a normal thing for a mod loader to do - but you should know it's
 happening.
 
-**Your connection isn't encrypted, and there's no anti-cheat.** Stats coming
-from your opponent are bounds-checked so nobody can spawn something unkillable,
-and a peer has to pass a handshake before anything is exchanged - but a
-determined person could still cheat. Play with people you know.
+**There's no anti-cheat.** Stats coming from your opponent are bounds-checked 
+so nobody can spawn something unkillable, and a peer has to pass a handshake 
+before anything is exchanged - but a determined person could still cheat. 
+Play with people you know.
 
 **Both players must run the same build of the DLL.** Different versions refuse
 to connect rather than misbehave. If you update, send your friend the new file.

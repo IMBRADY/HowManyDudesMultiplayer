@@ -1,0 +1,330 @@
+{
+  "_meta": {
+    "game": "How Many Dudes?",
+    "developer": "Butterscotch Shenanigans",
+    "engine": "GameMaker YYC (Windows x64)",
+    "data_win": "C:/Program Files (x86)/Steam/steamapps/common/How Many Dudes/data.win",
+    "extraction_method": "Direct FORM/chunk parse of data.win via tools/gm_parse.py (STRG/OBJT/SCPT/ROOM/SPRT/SOND). The CODE, FUNC and VARI chunks are absent because YYC compiles GML to native code, so no bytecode is recoverable; asset and script *names* survive in STRG and are what the runtime resolves against.",
+    "builds_analyzed": {
+      "note": "Steam patched the game partway through this analysis. Both builds were parsed and diffed; every object and script this mod depends on is present and unchanged in the newer build. The patch added one function (endscreen_tier_display) and renumbered some anonymous struct closures. No object, room, or referenced script was added or removed.",
+      "initial": {
+        "bytes": 122448661,
+        "strings": 22562,
+        "scripts": 10993,
+        "top_level_functions": 3182
+      },
+      "current": {
+        "bytes": 122449557,
+        "steam_buildid": "24513815",
+        "strings": 22572,
+        "scripts": 11003,
+        "top_level_functions": 3183,
+        "verified": "All names listed in this file re-confirmed present."
+      }
+    },
+    "counts": {
+      "objects": 160,
+      "gml_source_files": 333,
+      "rooms": 15
+    },
+    "confidence_legend": {
+      "confirmed": "Name read verbatim out of the data.win asset tables.",
+      "inferred": "Name is confirmed to exist; its stated ROLE is deduced from naming and the surrounding call-graph, and must be re-verified at runtime.",
+      "runtime": "Not resolvable statically under YYC. Must be discovered live via YYTKInterface::EnumInstanceMembers."
+    }
+  },
+
+  "game_loop_and_battle_manager": {
+    "primary_object": {
+      "name": "o_gameplay",
+      "confidence": "confirmed",
+      "role": "Top-level gameplay/battle controller. Exists only in rm_gameplay. This is the anchor instance the mod attaches its state machine to.",
+      "known_events": [
+        "gml_Object_o_gameplay_Create_0",
+        "gml_Object_o_gameplay_Step_0"
+      ]
+    },
+    "supporting_objects": {
+      "o_gameplay_camera": "confirmed - arena camera",
+      "o_camera_anchor": "confirmed - camera target",
+      "o_persistent_controller": "confirmed - persists across rooms; survives the rm_gameplay teardown, so it is the safe place to park cross-act mod state",
+      "o_micromanage": "confirmed - per-unit micromanagement controller",
+      "o_input": "confirmed - input controller"
+    },
+    "gameplay_room": {
+      "name": "rm_gameplay",
+      "confidence": "confirmed",
+      "all_rooms": [
+        "rm_init", "rm_settings", "rm_mainmenu", "rm_gameplay", "rm_ranch",
+        "rm_custom_matchup", "rm_collections", "rm_best_runs", "rm_achievements",
+        "rm_rumpus_login", "rm_xbox_init", "rm_user_transition",
+        "rm_save_and_exit", "rm_saves_manager", "rm_splash"
+      ]
+    }
+  },
+
+  "roster_and_army_tracking": {
+    "objects": {
+      "o_dude_roster": {
+        "confidence": "confirmed",
+        "role": "The roster / army tracking structure. Owns dude ordering, slot adjacency and roster-wide queries."
+      },
+      "o_dude": {
+        "confidence": "confirmed",
+        "role": "A single player-army unit instance."
+      },
+      "o_dude_temporary": {
+        "confidence": "confirmed",
+        "role": "Transient dude (not a permanent roster member). Distinguished at runtime by dude_is_temporary()."
+      },
+      "o_enemy": {
+        "confidence": "confirmed",
+        "role": "A single enemy unit instance. This is what the opponent's army is spawned as."
+      },
+      "o_combatant": {
+        "confidence": "confirmed",
+        "role": "Shared base for o_dude and o_enemy. Combat stats live at this level, so IsInstanceOfObject(inst, o_combatant) is the correct broad filter.",
+        "known_events": ["gml_Object_o_combatant_Create_0"]
+      },
+      "o_body_sprite": "confirmed - visual body attachment",
+      "o_overhead_sprite": "confirmed - overhead UI attachment",
+      "o_ranch_dude": "confirmed - out-of-combat dude representation in rm_ranch"
+    },
+    "roster_query_functions": {
+      "confidence": "confirmed",
+      "note": "All are top-level GML script functions callable by name through YYTKInterface::CallGameScriptEx.",
+      "functions": [
+        "roster_get_first_dude_ids",
+        "roster_get_last_dude_ids",
+        "roster_get_next_dude_ids",
+        "roster_get_prior_dude_ids",
+        "roster_get_adjacent_dude_ids",
+        "roster_get_first_dude_type",
+        "roster_get_last_dude_type",
+        "roster_get_next_dude_type",
+        "roster_get_prior_dude_type",
+        "roster_get_nth_dude_type",
+        "roster_get_adjacent_dude_types",
+        "roster_get_num_dudes_of_type",
+        "roster_get_num_dudes_excluding_types",
+        "roster_order_refresh",
+        "roster_refresh_num_unconscious_dudes",
+        "roster_slot_has_neighbor_effect",
+        "dude_type_add_to_roster",
+        "get_most_injured_roster_dude"
+      ]
+    },
+    "dude_lifecycle_functions": {
+      "confidence": "confirmed",
+      "functions": [
+        "dude_spawn",
+        "dude_generate",
+        "dude_get",
+        "dude_delete",
+        "dude_set_active",
+        "dude_knock_out",
+        "dude_revive",
+        "dude_is_knocked_out",
+        "dude_is_temporary",
+        "dude_body_spawn",
+        "dude_body_despawn",
+        "dudes_recalculate_stats",
+        "dude_stat_get_value",
+        "dude_stat_get_boosted_amount",
+        "dude_bonus_add",
+        "dude_bonus_add_from_dude_type",
+        "dude_bonus_add_relic",
+        "dude_bonus_add_trinket",
+        "dude_bonuses_clear",
+        "init_dude_types"
+      ]
+    },
+    "combatant_stat_fields": {
+      "confidence": "inferred",
+      "note": "These identifiers appear verbatim in STRG and are consistent with the stat system (dude_stat_get_value / dudes_recalculate_stats). Exact per-instance member names MUST be confirmed at runtime with EnumInstanceMembers before being relied on; the mod does this and logs the real member list.",
+      "candidates": [
+        "attack", "damage", "speed", "range", "team", "owner",
+        "crit_chance", "crit_damage", "crit_resistance", "crit_weakness", "crittable",
+        "stat", "stats"
+      ]
+    },
+    "instance_members": {
+      "confidence": "runtime",
+      "note": "YYC strips the VARI chunk, so instance variable layout cannot be enumerated from data.win. The mod resolves members live via YYTKInterface::EnumInstanceMembers on the first o_dude it sees and writes the result to the log."
+    }
+  },
+
+  "serialization_format_ALREADY_IN_GAME": {
+    "_why_this_matters": "The game ships a complete, self-consistent matchup serializer used by the Custom Matchup screen's Export/Import to Clipboard buttons. It already encodes exactly what this mod needs to exchange: the full dude army plus enemies, relics, trinkets, consumables, arena modifiers, cash, food and boss. Reusing it is dramatically safer than reconstructing army state from raw instance memory, because the game's own import path performs its own validation and spawning.",
+    "confidence": "confirmed",
+    "functions": [
+      "custom_matchup_export (via button_custom_matchup_export)",
+      "custom_matchup_import (via button_custom_matchup_import)",
+      "custom_matchup_parse",
+      "custom_matchup_save",
+      "custom_matchup_load",
+      "custom_matchup_begin",
+      "custom_matchup_fightable",
+      "current_round_to_custom_matchup_clipboard",
+      "CustomMatchup",
+      "MatchupSaveData",
+      "EnemyExportInfo"
+    ],
+    "payload_keys": [
+      "dudes", "enemies", "relics", "trinkets", "consumables",
+      "arenamods", "cash", "food", "boss"
+    ],
+    "evidence_strings": [
+      "Imported custom matchup from clipboard.",
+      "gml_Script_custom_matchup_import",
+      "gml_Script_button_custom_matchup_export",
+      "gml_Script_custom_matchup_parse"
+    ],
+    "notable": "current_round_to_custom_matchup_clipboard converts the LIVE current round into the exportable custom-matchup representation. That is the single highest-value hook target in the whole binary for this mod: it is the game's own 'snapshot my army right now' routine."
+  },
+
+  "end_of_act_and_progression": {
+    "act_functions": {
+      "confidence": "confirmed",
+      "functions": [
+        "init_acts",
+        "act_get_info",
+        "act_get_name",
+        "act_get_icon",
+        "get_act_number",
+        "ActInfo",
+        "act_transition_spawn",
+        "ActTransitionController",
+        "ActTransitionDude"
+      ],
+      "source_files": ["Acts", "ActTransitions"]
+    },
+    "victory_path": {
+      "confidence": "confirmed",
+      "role": "End-of-act victory / progression. victory_ui_round_finish is the point at which a round is resolved and progression advances - the primary interception point for halting normal act progression.",
+      "functions": [
+        "victory_ui_round_finish",
+        "victory_ui_spawn",
+        "victory_ui_roster_spawn",
+        "button_victory_choose_reward",
+        "round_end_rewards_populate",
+        "promoter_round_finish"
+      ],
+      "source_files": [
+        "VictoryUI", "VictoryUIRoster", "VictoryUIGold", "VictoryUIConsumables",
+        "VictoryUIFreeDude", "VictoryRecruitmentUI", "VictoryTrinketUI",
+        "VictoryCashBonuses"
+      ]
+    },
+    "loss_path": {
+      "confidence": "confirmed",
+      "functions": [
+        "loss_ui_spawn",
+        "button_loss_go_again",
+        "button_loss_mainmenu",
+        "button_loss_ui",
+        "button_loss_ui_view_collectibles",
+        "button_loss_ui_promoter_and_custom_end"
+      ],
+      "source_files": ["LossUI", "LossCollectiblesUI", "EndscreenBreakdown", "KnockoutReport"]
+    },
+    "round_state": {
+      "confidence": "confirmed",
+      "functions": [
+        "jump_to_round",
+        "get_round_to_jump_to",
+        "round_get_difficulty_score",
+        "round_get_estimated_dude_count",
+        "round_has_boss",
+        "round_has_shop",
+        "wave_real",
+        "hmd_telemetry_record_round_end"
+      ]
+    },
+    "run_progress": {
+      "confidence": "confirmed",
+      "functions": [
+        "load_progress",
+        "GameplaySaveContents",
+        "reset_all_save_progress",
+        "gameplay_callbacks_refresh",
+        "StateManager"
+      ],
+      "source_files": ["Progress", "GlobalProgress", "RunMap", "States", "GameplayCallbacks", "GameModes"]
+    }
+  },
+
+  "enemy_wave_spawner": {
+    "primary": {
+      "name": "matchup_get_enemies_to_fit",
+      "confidence": "confirmed",
+      "role": "Selects the enemy set for a matchup subject to a difficulty/size budget. This is the default wave composition routine that the mod must suppress and replace with the peer's army."
+    },
+    "functions": {
+      "confidence": "confirmed",
+      "list": [
+        "matchup_begin",
+        "Matchup",
+        "matchup_get_enemies_to_fit",
+        "enemy_spawn",
+        "enemies_get_available_for_round",
+        "enemies_register_trait_callbacks",
+        "matchup_simulator_spawn",
+        "matchup_simulator_spawn_selector",
+        "boss_fight_generate_for_round",
+        "boss_fight_get_for_round",
+        "BossFightInfo",
+        "init_bosses"
+      ],
+      "source_files": ["Matchups", "MatchupSimulator", "Bosses", "CatEnemies", "GorillaEnemies", "Flyers", "Killipede", "Goddler", "TheGoat", "Scavenger"]
+    },
+    "enemy_query_helpers": {
+      "confidence": "confirmed",
+      "list": [
+        "get_living_enemies_list_copy",
+        "get_nearest_enemy",
+        "get_nearest_enemies_priority",
+        "get_farthest_enemy",
+        "get_random_enemy_instance",
+        "get_enemies_priority_by_hp",
+        "custom_matchup_get_num_enemies"
+      ]
+    }
+  },
+
+  "hook_plan": {
+    "note": "Ordered by preference. The mod resolves each by name at load time via YYTKInterface::GetNamedRoutineIndex and degrades gracefully (logging a warning, leaving vanilla behaviour intact) for any that fail to resolve.",
+    "targets": [
+      {
+        "function": "victory_ui_round_finish",
+        "purpose": "Intercept end-of-act. Halt normal progression, snapshot local army, transmit, await peer payload."
+      },
+      {
+        "function": "current_round_to_custom_matchup_clipboard",
+        "purpose": "Reuse as the army snapshot serializer for the local roster."
+      },
+      {
+        "function": "matchup_get_enemies_to_fit",
+        "purpose": "Suppress default wave generation while a peer army is queued for injection."
+      },
+      {
+        "function": "custom_matchup_parse",
+        "purpose": "Deserialize the peer's payload using the game's own validated parser."
+      },
+      {
+        "function": "matchup_begin",
+        "purpose": "Inject the peer army as the opponent wave at matchup start."
+      },
+      {
+        "function": "loss_ui_spawn",
+        "purpose": "Intercept battle completion (loss branch) to resolve the shared 3-lives system."
+      }
+    ]
+  },
+
+  "runtime_resolution_notes": {
+    "script_name_convention": "Top-level GML functions appear in STRG as 'gml_Script_<name>'. Nested closures append their scope chain: 'gml_Script_<inner>@<outer>@<SourceFile>'. Only the top-level 'gml_Script_<name>' form is resolvable by GetNamedRoutineIndex.",
+    "yyc_caveat": "Because this build is YYC, there is no CODE chunk and therefore no bytecode to inspect or patch. All interception must be native (inline hooks on resolved routine pointers) rather than bytecode-level.",
+    "safety": "Every routine lookup, instance pointer and member read in the mod is null-checked; failures log through the YYTK console and fall through to vanilla behaviour rather than crashing the game loop."
+  }
+}

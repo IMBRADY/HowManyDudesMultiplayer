@@ -1,8 +1,47 @@
-# Build output and analysis working copies. Note that .gitignore.txt, which
-# this replaces, had no effect - Git only reads a file named exactly
-# ".gitignore".
-build/
+# Note: .gitignore.txt, which this replaces, had no effect - Git only reads a
+# file named exactly ".gitignore".
+
+# --- Game content. Never ship. ---------------------------------------------
+# workspace/ holds copies of data.win (117 MB each) and everything extracted
+# from them. That is the game's own content, not this mod's.
 workspace/
 
-MOD_CHANGES.md
+# --- Build output ----------------------------------------------------------
+# The DLL ships as a Release asset, not as a tracked file.
+build/
+*.obj
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.exe
+*.stackdump
+
+# --- Secrets ---------------------------------------------------------------
+# The generated config carries session_key, the shared connection passphrase.
+# The .example is the tracked one and has an empty key.
+HowManyDudesMultiplayer.ini
+!HowManyDudesMultiplayer.ini.example
+
+# --- Upstream binaries -----------------------------------------------------
+# Aurie and YYToolkit release zips. include/ has the headers we build against;
+# players download the frameworks themselves (see README Step 2).
+vendor/
+
+# --- Runtime logs ----------------------------------------------------------
+*.boot.log
+aurie.log
+YYToolkit.log
+
+# --- Tooling ---------------------------------------------------------------
+__pycache__/
+*.pyc
+.vs/
+*.user
+*.VC.db
+
+# --- Development -----------------------------------------------------------
+# Task spec for the development session, not part of the mod.
 PROMPT.md
+MOD_CHANGES.md

@@ -1,0 +1,77 @@
+HowManyDudesMultiplayer
+Copyright (C) 2026 Braden Atzert
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or (at your
+option) any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+
+WHY AGPL-3.0
+------------
+
+This is not a free choice of licence. The plugin incorporates source code
+from two AGPL-3.0 projects:
+
+  * the YYToolkit SDK headers in include/YYToolkit/, one of which
+    (YYTK_Shared_Types.cpp) is compiled directly into the shipped DLL;
+  * the Aurie Framework header in include/Aurie/.
+
+Because AGPL-3.0 code is built into the binary, the binary is a derivative
+work and must be distributed under AGPL-3.0. Neither upstream project grants
+a linking or plugin exception.
+
+In practice this means anyone you give the DLL to is entitled to the
+corresponding source for the version they received.
+
+
+THIRD-PARTY COMPONENTS
+----------------------
+
+YYToolkit
+  include/YYToolkit/YYTK_Shared.hpp
+  include/YYToolkit/YYTK_Shared_Base.hpp
+  include/YYToolkit/YYTK_Shared_Interface.hpp
+  include/YYToolkit/YYTK_Shared_Types.hpp
+  include/YYToolkit/YYTK_Shared_Types.cpp
+  include/FunctionWrapper/FunctionWrapper.hpp
+
+  Copyright (C) the YYToolkit authors
+  Licensed under AGPL-3.0
+  https://github.com/AurieFramework/YYToolkit
+
+  Taken unmodified from ExamplePlugin/include on the "experimental" branch
+  at commit d5cc0078. This generation matters: the headers must match the
+  YYToolkit build in use (v5.0.0c), or the interface fails to resolve and
+  the module is unloaded at startup.
+
+Aurie Framework
+  include/Aurie/shared.hpp
+
+  Copyright (C) the Aurie Framework authors
+  Licensed under AGPL-3.0
+  https://github.com/AurieFramework/Aurie
+
+Both licences are the standard unmodified AGPL-3.0 text, the same text
+reproduced in LICENSE.
+
+
+NOT COVERED BY THIS LICENCE
+---------------------------
+
+"How Many Dudes?" is a commercial game and is not part of this repository.
+No game asset, data file, executable, or extracted content is included or
+redistributed here. This project is an unofficial third-party modification
+and is not affiliated with or endorsed by the game's developers or
+publisher.
+
+Steamworks is accessed through the steam_api64.dll the game already loads;
+no Steamworks SDK is vendored or redistributed.

@@ -1,0 +1,39 @@
+; HowManyDudesMultiplayer session config.
+;
+; You do not need this file. The mod writes its own
+; HowManyDudesMultiplayer.ini next to the DLL on the first run, with these
+; same defaults and comments, and never overwrites it afterwards. This copy
+; is here for reference.
+;
+; If you do want to use it: putting it beside the DLL under either name works.
+; The mod reads HowManyDudesMultiplayer.ini if it exists, otherwise falls back
+; to this .example file, so copying it without renaming still applies.
+
+; Where the JOINING player looks for the host. Ignored by the host.
+;   auto             - find the host automatically on the local network.
+;                      No addresses to exchange. (default)
+;   <ip or hostname> - dial that address instead. Needed over the internet,
+;                      or if discovery is blocked on your network.
+peer_address = auto
+
+; TCP port. Both players must agree. The host must have it reachable.
+; LAN discovery uses the next port up (default 47802).
+port = 47801
+
+; Shared passphrase. Both players must set the SAME value or the connection
+; is refused. Leave empty on a trusted LAN. Set it to anything you both agree
+; on before forwarding the port to the internet, otherwise any host that can
+; reach the port may join.
+;
+; Note: traffic is not encrypted. This controls who may connect; it does not
+; hide what is sent.
+session_key =
+
+; Answer and send local-network discovery probes. Turn off to make the mod
+; address-only.
+enable_discovery = true
+
+; Open a session automatically at load instead of waiting for F9/F10.
+; Set at most one of these, on the matching machine.
+auto_host = false
+auto_join = false
