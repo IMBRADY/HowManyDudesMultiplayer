@@ -31,8 +31,9 @@ don't need Visual Studio, or any source code. Just the built file.
 Alternatively, you can run this in terminal:
 - **Find your game folder:** in Steam, right-click *How Many Dudes?* → **Manage** → **Browse local files**.
 ```
-install.bat "C:\Program Files (x86)\Steam\steamapps\common\How Many Dudes" (The file location you just found)
+install.bat "C:\Program Files (x86)\Steam\steamapps\common\How Many Dudes" 
 ```
+(The file location you just found)
 
 ---
 
