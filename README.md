@@ -25,12 +25,10 @@ don't need Visual Studio, or any source code. Just the built file.
 
 ## Step 1 - Install this mod
 
-- **Double-click `install.bat`** in this folder. It will:
-If it can't find the game on its own, run it from a terminal with the path:
-- cd into your 
-- **Find your game folder:** in Steam, right-click *How Many Dudes?* →
-- **Manage** → **Browse local files**.
+- **Double-click `install.bat`**
+- **Find your game folder:** in Steam, right-click *How Many Dudes?* → **Manage** → **Browse local files**.
 - Save the **AuriePatcher.exe "C:\..."** line for later
+Alternatively, you can run this in terminal:
 ```
 install.bat "C:\Program Files (x86)\Steam\steamapps\common\How Many Dudes"
 ```
@@ -45,8 +43,8 @@ This mod needs two free tools underneath it: **Aurie**  and **YYToolkit**
 
 - From the [latest Aurie release](https://github.com/AurieFramework/Aurie/releases/latest),
 download **`AurieCore.dll`**, **not** `AurieCore-x86.dll`
-download **`AuriePatcher.exe`**.
-- Put it in: `...\How Many Dudes\mods\Native\` **same directory as the steam folder you were in earlier**
+- Download **`AuriePatcher.exe`**.
+- Put it in: `...\How Many Dudes\mods\Native\` **same directory as the steam folder that you were in earlier**
 
 ### 2b. YYToolkit.dll
 
@@ -62,7 +60,6 @@ AuriePatcher.exe "C:\Program Files (x86)\Steam\steamapps\common\How Many Dudes\H
 ```
 Note: This directory may be different depending on where your steamapps folder is located.
 
-This edits the game executable so Aurie loads with it. It only needs doing once.
 If you ever use Steam's *Verify integrity of game files*, that undoes it - just
 run the command again.
 
