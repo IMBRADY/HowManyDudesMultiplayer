@@ -43,8 +43,8 @@ This mod needs two free tools underneath it: **Aurie**  and **YYToolkit**
 
 - From the [latest Aurie release](https://github.com/AurieFramework/Aurie/releases/latest),
 download **`AurieCore.dll`**, **not** `AurieCore-x86.dll`
-- Download **`AuriePatcher.exe`**.
 - Put it in: `...\How Many Dudes\mods\Native\` **same directory as the steam folder that you were in earlier**
+- Download **`AuriePatcher.exe`**. Leave it anywhere for now
 
 ### 2b. YYToolkit.dll
 
@@ -54,7 +54,7 @@ download **`YYToolkit.dll`**.
 
 ### 2c. Patch the game
 
-Open a terminal in that folder and run the AuriePatcher line you saved:
+Open a terminal **in the directory that you saved AuriePatcher.exe**. Run the AuriePatcher line you saved:
 ```
 AuriePatcher.exe "C:\Program Files (x86)\Steam\steamapps\common\How Many Dudes\HowManyDudes.exe" "C:\Program Files (x86)\Steam\steamapps\common\How Many Dudes\mods\Native\AurieCore.dll" install
 ```
