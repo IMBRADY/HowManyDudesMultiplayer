@@ -1,6 +1,3 @@
-# Note: .gitignore.txt, which this replaces, had no effect - Git only reads a
-# file named exactly ".gitignore".
-
 # --- Game content. Never ship. ---------------------------------------------
 # workspace/ holds copies of data.win (117 MB each) and everything extracted
 # from them. That is the game's own content, not this mod's.
@@ -31,7 +28,7 @@ vendor/
 
 # --- Runtime logs ----------------------------------------------------------
 *.boot.log
-aurie.log
+aurielogs/
 YYToolkit.log
 
 # --- Tooling ---------------------------------------------------------------
