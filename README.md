@@ -1,4 +1,4 @@
-# How Many Dudes? — Multiplayer Mod
+# How Many Dudes? Multiplayer Mod
 
 Turns the single-player run into a **two-player duel**. You both play your own
 run as normal; at the end of each act you swap armies and fight each other's
