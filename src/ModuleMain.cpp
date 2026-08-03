@@ -18,8 +18,11 @@
 #include "Log.h"
 #include "Match.h"
 #include "Net.h"
+#include "Probe.h"
 #include "Roster.h"
+#include "RunState.h"
 #include "Steam.h"
+#include "Ui.h"
 
 #include <chrono>
 #include <cstdarg>
@@ -60,6 +63,17 @@ namespace
 		bool enable_discovery = true;
 		bool auto_host = false;
 		bool auto_join = false;
+
+		// Rounds between duels. 20 is the length of an act, so by default the
+		// duel lands exactly where the boss fight would have been.
+		int duel_interval = 20;
+
+		// Whether one player pressing "start run" starts the other's run too.
+		bool sync_run_start = true;
+
+		// Show the mod's messages on screen through the game's own info
+		// stream. Turning this off falls back to log-only.
+		bool on_screen_messages = true;
 	};
 
 	Config g_Config;
@@ -77,6 +91,12 @@ namespace
 	constexpr int kKeyJoin = VK_F10;
 	constexpr int kKeyDisconnect = VK_F11;
 	constexpr int kKeyStatus = VK_F8;
+
+	// Dumps everything the mod discovered about this build of the game. The
+	// features that draw or that need a round number depend on things YYC left
+	// undiscoverable in data.win, so when one of them misbehaves this is what
+	// says which part did not resolve.
+	constexpr int kKeyProbe = VK_F6;
 
 	bool WasKeyPressed(int VirtualKey)
 	{
@@ -140,7 +160,22 @@ namespace
 			"; Open a session automatically at load instead of waiting for\n"
 			"; F9/F10. Set at most one, on the matching machine.\n"
 			"auto_host = false\n"
-			"auto_join = false\n";
+			"auto_join = false\n"
+			"\n"
+			"; How many rounds between duels. Every this many rounds the boss\n"
+			"; fight is replaced by a fight against your opponent's army. 20 is\n"
+			"; the length of an act, so the duel lands where the boss would.\n"
+			"; Whoever gets there first waits for the other.\n"
+			"duel_interval = 20\n"
+			"\n"
+			"; Pressing 'start run' also starts your opponent's run, so you\n"
+			"; both enter a run together. Turn off to start runs separately.\n"
+			"sync_run_start = true\n"
+			"\n"
+			"; Show the mod's messages on screen using the game's own message\n"
+			"; stream. Turn off if it misbehaves - everything the mod says\n"
+			"; still goes to aurie.log either way.\n"
+			"on_screen_messages = true\n";
 
 		hmd::LogInfo("wrote a default config to %s", ConfigPath.string().c_str());
 	}
@@ -174,6 +209,23 @@ namespace
 		else if (Key == "auto_join")
 		{
 			g_Config.auto_join = (Value == "1" || Value == "true");
+		}
+		else if (Key == "duel_interval")
+		{
+			int parsed = atoi(Value.c_str());
+			if (parsed > 0 && parsed <= 500)
+				g_Config.duel_interval = parsed;
+			else
+				hmd::LogWarn("ignoring out-of-range duel_interval '%s'",
+					Value.c_str());
+		}
+		else if (Key == "sync_run_start")
+		{
+			g_Config.sync_run_start = (Value == "1" || Value == "true");
+		}
+		else if (Key == "on_screen_messages")
+		{
+			g_Config.on_screen_messages = (Value == "1" || Value == "true");
 		}
 	}
 
@@ -232,14 +284,16 @@ namespace
 		}
 
 		hmd::LogInfo("config: peer=%s port=%u discovery=%d key=%s "
-			"auto_host=%d auto_join=%d",
+			"auto_host=%d auto_join=%d duel_interval=%d sync_run_start=%d",
 			g_Config.peer_address.c_str(),
 			g_Config.port,
 			g_Config.enable_discovery ? 1 : 0,
 			// Never log the passphrase itself.
 			g_Config.session_key.empty() ? "none" : "set",
 			g_Config.auto_host ? 1 : 0,
-			g_Config.auto_join ? 1 : 0);
+			g_Config.auto_join ? 1 : 0,
+			g_Config.duel_interval,
+			g_Config.sync_run_start ? 1 : 0);
 	}
 
 	// Joining is either discovery-driven or address-driven, and both hotkeys
@@ -290,10 +344,20 @@ namespace
 			lives.remote,
 			room.c_str());
 
-		hmd::LogInfo("status: you are %s | opponent is %s (act %d)",
+		hmd::LogInfo("status: you are %s (round %d) | opponent %s is %s "
+			"(act %d, round %d)",
 			local_in_run ? "in a run" : "not in a run",
+			hmd::runstate::CurrentRound(),
+			presence.name.empty() ? "?" : presence.name.c_str(),
 			opponent,
-			presence.act);
+			presence.act,
+			presence.round);
+
+		hmd::LogInfo("status: duels every %d rounds | next duel at round %d | "
+			"on-screen messages %s",
+			hmd::runstate::DuelInterval(),
+			hmd::runstate::NextDuelRound(hmd::runstate::CurrentRound() + 1),
+			hmd::ui::NotificationsAvailable() ? "working" : "not confirmed");
 
 		std::string error = hmd::net::LastError();
 		if (!error.empty())
@@ -343,6 +407,9 @@ namespace
 
 		if (WasKeyPressed(kKeyStatus))
 			PrintStatus();
+
+		if (WasKeyPressed(kKeyProbe))
+			hmd::probe::Report();
 	}
 
 	// Everything the mod does per-tick funnels through here.
@@ -376,14 +443,30 @@ namespace
 
 		HandleHotkeys();
 		hmd::steam::Tick();
+
+		// Order matters here. runstate ages out the run-map cells the overlay
+		// draws against, ui refreshes the per-frame draw budget, and match is
+		// what decides what the overlay should be showing - so match runs last
+		// and its output is drawn on the frames that follow.
+		hmd::runstate::Tick();
+		hmd::ui::Tick();
 		hmd::match::Tick();
+		hmd::probe::Tick();
 	}
 
 	// Observe-only. Not calling Call() leaves YYToolkit to invoke the original,
 	// so the game's own code runs exactly as it would without the mod.
 	void CodeCallback(FWCodeEvent& CodeContext)
 	{
-		UNREFERENCED_PARAMETER(CodeContext);
+		// The census is how the mod learns whether this runner exposes named
+		// code entries at all, which decides whether object Draw events are a
+		// viable hook target on this build. It closes itself after a few
+		// seconds and costs nothing afterwards.
+		// FWCodeEvent wraps bool(CInstance*, CInstance*, CCode*, int, RValue*),
+		// so the code entry is the third element of the argument tuple.
+		if (hmd::probe::CensusOpen())
+			hmd::probe::NoteCodeEntry(std::get<2>(CodeContext.Arguments()));
+
 		PumpOnce();
 	}
 
@@ -479,9 +562,20 @@ EXPORTED AurieStatus ModuleInitialize(
 	// Direct TCP sessions keep working either way.
 	hmd::steam::Initialize();
 
+	// Run position and the overlay come up before the match layer, because
+	// match hands both of them work on its very first tick.
+	hmd::runstate::SetDuelInterval(g_Config.duel_interval);
+	hmd::runstate::Initialize(Module);
+	hmd::ui::Initialize(Module);
+	hmd::ui::SetNotificationsEnabled(g_Config.on_screen_messages);
+
+	hmd::match::SetSyncRunStart(g_Config.sync_run_start);
+
 	if (!hmd::match::Initialize(Module))
 	{
 		hmd::LogError("match subsystem failed to start");
+		hmd::ui::Shutdown(Module);
+		hmd::runstate::Shutdown(Module);
 		hmd::net::Shutdown();
 		return AURIE_MODULE_INITIALIZATION_FAILED;
 	}
@@ -499,6 +593,8 @@ EXPORTED AurieStatus ModuleInitialize(
 		hmd::LogError("could not register the code callback (status %d) - "
 			"the mod cannot run", static_cast<int>(status));
 		hmd::match::Shutdown(Module);
+		hmd::ui::Shutdown(Module);
+		hmd::runstate::Shutdown(Module);
 		hmd::steam::Shutdown();
 		hmd::net::Shutdown();
 		return AURIE_MODULE_INITIALIZATION_FAILED;
@@ -515,13 +611,14 @@ EXPORTED AurieStatus ModuleInitialize(
 	if (hmd::steam::Available())
 	{
 		hmd::LogInfo("ready. F7 invite a Steam friend | F9 host | F10 join | "
-			"F11 disconnect | F8 status");
+			"F11 disconnect | F8 status | F6 diagnostics");
 		hmd::LogInfo("easiest way to play: press F7 twice - once to open a "
 			"lobby, again to pick a friend. No ports, works over the internet.");
 	}
 	else
 	{
-		hmd::LogInfo("ready. F9 host | F10 join | F11 disconnect | F8 status");
+		hmd::LogInfo("ready. F9 host | F10 join | F11 disconnect | F8 status | "
+			"F6 diagnostics");
 
 		if (JoiningByDiscovery() && g_Config.enable_discovery)
 		{
@@ -543,6 +640,8 @@ EXPORTED AurieStatus ModuleUnload(
 	hmd::LogInfo("unloading");
 
 	hmd::match::Shutdown(Module);
+	hmd::ui::Shutdown(Module);
+	hmd::runstate::Shutdown(Module);
 	hmd::steam::Shutdown();
 	hmd::net::Shutdown();
 

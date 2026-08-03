@@ -5,6 +5,7 @@
 
 #include <windows.h>
 
+#include <cstddef>
 #include <deque>
 #include <mutex>
 
@@ -31,6 +32,10 @@ namespace hmd::steam
 		constexpr int kLobbyCreated = 500 + 13;
 		constexpr int kLobbyEnter = 500 + 4;
 		constexpr int kGameLobbyJoinRequested = 300 + 33;
+
+		// k_iSteamNetworkingMessagesCallbacks = 1250.
+		// SteamNetworkingMessagesSessionRequest_t is the first of them.
+		constexpr int kMessagesSessionRequest = 1250 + 1;
 
 		// ELobbyType::k_ELobbyTypeFriendsOnly
 		constexpr int kLobbyTypeFriendsOnly = 1;
@@ -77,6 +82,14 @@ namespace hmd::steam
 			uint64_t m_steamIDLobby;
 			uint64_t m_steamIDFriend;
 		};
+
+		// Raised on the RECEIVING side the first time a peer tries to send to
+		// us. Until it is answered with AcceptSessionWithUser, the sender's
+		// messages fail - which is the entire reason this struct exists here.
+		struct MessagesSessionRequest_t
+		{
+			SteamNetworkingIdentity m_identityRemote;
+		};
 		#pragma pack(pop)
 
 		static_assert(sizeof(SteamNetworkingIdentity) == 136,
@@ -84,14 +97,27 @@ namespace hmd::steam
 		static_assert(sizeof(LobbyCreated_t) == 12, "LobbyCreated_t layout changed");
 		static_assert(sizeof(GameLobbyJoinRequested_t) == 16,
 			"GameLobbyJoinRequested_t layout changed");
+		static_assert(sizeof(MessagesSessionRequest_t) == 136,
+			"MessagesSessionRequest_t layout does not match the Steamworks ABI");
 
 		// SteamNetworkingMessage_t, as received from ReceiveMessagesOnChannel.
 		// Only the leading fields are read; m_pfnRelease is called to free it.
+		//
+		// Every field here has to be exactly right, not just the ones that get
+		// read. m_conn was declared uint64_t in the first version of this file;
+		// the real HSteamNetConnection is uint32, and getting it wrong pushed
+		// everything after it eight bytes along - so m_pfnRelease was read out
+		// of m_nChannel and m_nFlags and called as a function pointer. The game
+		// died on the first message it ever successfully received.
+		//
+		// The offsets are asserted below rather than trusted, because this
+		// struct is only exercised once a real peer sends something, which is
+		// the worst possible place for a silent layout error to be waiting.
 		struct SteamNetworkingMessage_t
 		{
 			void* m_pData;
 			int32_t m_cbSize;
-			uint64_t m_conn;
+			uint32_t m_conn;         // HSteamNetConnection - uint32, NOT uint64
 			SteamNetworkingIdentity m_identityPeer;
 			int64_t m_nConnUserData;
 			int64_t m_usecTimeReceived;
@@ -104,6 +130,18 @@ namespace hmd::steam
 			uint16_t m_idxLane;
 			uint16_t m__pad1;
 		};
+
+		static_assert(offsetof(SteamNetworkingMessage_t, m_pData) == 0,
+			"SteamNetworkingMessage_t::m_pData moved");
+		static_assert(offsetof(SteamNetworkingMessage_t, m_cbSize) == 8,
+			"SteamNetworkingMessage_t::m_cbSize moved");
+		static_assert(offsetof(SteamNetworkingMessage_t, m_identityPeer) == 16,
+			"SteamNetworkingMessage_t::m_identityPeer moved - check m_conn's width");
+		static_assert(offsetof(SteamNetworkingMessage_t, m_pfnRelease) == 184,
+			"SteamNetworkingMessage_t::m_pfnRelease moved - calling this at the "
+			"wrong offset jumps into whatever follows it");
+		static_assert(sizeof(SteamNetworkingMessage_t) == 216,
+			"SteamNetworkingMessage_t layout does not match the Steamworks ABI");
 
 		// Steam's C++ callback base. SteamAPI_RegisterCallback expects an
 		// object with this exact shape: three virtuals, then the two data
@@ -313,6 +351,50 @@ namespace hmd::steam
 			}
 		}
 
+		// Accepting an invite while the game is CLOSED does not raise
+		// GameLobbyJoinRequested. Steam launches the game with
+		// "+connect_lobby <id>" on the command line instead and expects the
+		// game to act on it - so a mod that only listens for the callback sees
+		// nothing at all, and the guest never enters the lobby. This closes
+		// that hole.
+		//
+		// Runs once. The command line does not change, and re-joining a lobby
+		// we have already left would fight the player's own F11.
+		void JoinLobbyFromCommandLine()
+		{
+			static bool considered = false;
+			if (considered)
+				return;
+			considered = true;
+
+			const char* command_line = GetCommandLineA();
+			if (!command_line)
+				return;
+
+			const char* found = strstr(command_line, "+connect_lobby");
+			if (!found)
+				return;
+
+			found += strlen("+connect_lobby");
+			while (*found == ' ' || *found == '\t')
+				found++;
+
+			const CSteamID lobby = _strtoui64(found, nullptr, 10);
+			if (lobby == 0)
+			{
+				LogWarn("steam: launched with +connect_lobby but the id could "
+					"not be read - press F7 to connect instead");
+				return;
+			}
+
+			LogStage(kStageConnect,
+				"steam: launched from an invite - joining the lobby");
+
+			g_Lobby = lobby;
+			g_Api.JoinLobby(g_Matchmaking, g_Lobby);
+			SetState(LobbyState::Joining, "invite accepted at launch");
+		}
+
 		// --- Callback shims ----------------------------------------------
 
 		class JoinRequestedCallback : public CallbackBase
@@ -325,6 +407,21 @@ namespace hmd::steam
 					return;
 
 				LogStage(kStageConnect, "steam: invite accepted - joining lobby");
+
+				// Leave our own lobby first if we have one. Both players
+				// pressing F7 leaves each of them hosting, and accepting an
+				// invite while still in your own lobby leaves the client in two
+				// lobbies at once - after which the state machine flips between
+				// "joined" and "own lobby ready" and neither player can tell
+				// which session is real. Seen in the wild; this is the fix.
+				if (g_Lobby && g_Api.LeaveLobby)
+				{
+					LogInfo("steam: leaving your own lobby to join theirs");
+					g_Api.LeaveLobby(g_Matchmaking, g_Lobby);
+					g_Peer = 0;
+					g_PeerName.clear();
+				}
+
 				g_Lobby = request->m_steamIDLobby;
 				g_Api.JoinLobby(g_Matchmaking, g_Lobby);
 				SetState(LobbyState::Joining, "invite accepted");
@@ -366,14 +463,28 @@ namespace hmd::steam
 				const char* protocol = g_Api.GetLobbyData(
 					g_Matchmaking, g_Lobby, kLobbyKeyProtocol);
 
-				if (!protocol || strcmp(protocol, kLobbyProtocolValue) != 0)
+				// An ABSENT tag is not a mismatch. Lobby metadata replicates
+				// separately from lobby membership, so a guest can legitimately
+				// enter before the host's tag has reached them. Treating that as
+				// a version mismatch - which this used to do - drops the guest
+				// straight back out on a race, and the host just sees a lobby
+				// that never gains a second member.
+				if (protocol && strcmp(protocol, kLobbyProtocolValue) != 0)
 				{
-					LogError("steam: host is running a different version of this "
-						"mod - leaving");
+					LogError("steam: the host is running a different version of "
+						"this mod (theirs '%s', yours '%s') - leaving",
+						protocol, kLobbyProtocolValue);
 					LeaveSession();
 					return;
 				}
 
+				if (!protocol)
+				{
+					LogWarn("steam: the host's version tag has not replicated "
+						"yet - continuing anyway");
+				}
+
+				LogStage(kStageConnect, "steam: entered the host's lobby");
 				AdoptPeerFromLobby();
 			}
 
@@ -381,8 +492,43 @@ namespace hmd::steam
 			int GetCallbackSizeBytes() override { return sizeof(LobbyEnter_t); }
 		};
 
+		// Answering this is what makes peer-to-peer messaging work at all.
+		//
+		// AdoptPeerFromLobby calls AcceptSessionWithUser proactively on both
+		// sides, on the theory that if each end accepts the other up front,
+		// neither needs to handle an incoming request. That theory is wrong:
+		// Steam only honours AcceptSessionWithUser in response to a session
+		// request that actually exists. Called before the peer has sent
+		// anything, it does nothing.
+		//
+		// The result was that neither side ever accepted, so every single send
+		// returned k_EResultConnectFailed (35) forever, on both machines, while
+		// both clients cheerfully reported themselves connected because the
+		// lobby was fine. The lobby was never the problem.
+		class SessionRequestCallback : public CallbackBase
+		{
+		public:
+			void Run(void* Parameter) override
+			{
+				auto* request = static_cast<MessagesSessionRequest_t*>(Parameter);
+				if (!request || !g_Api.AcceptSessionWithUser || !g_Messages)
+					return;
+
+				const bool accepted = g_Api.AcceptSessionWithUser(
+					g_Messages, &request->m_identityRemote);
+
+				LogStage(kStageConnect,
+					"steam: peer opened a message session - %s",
+					accepted ? "accepted" : "REFUSED");
+			}
+
+			void Run(void* Parameter, bool, SteamAPICall_t) override { Run(Parameter); }
+			int GetCallbackSizeBytes() override { return sizeof(MessagesSessionRequest_t); }
+		};
+
 		JoinRequestedCallback g_JoinRequested;
 		LobbyEnterCallback g_LobbyEnter;
+		SessionRequestCallback g_SessionRequest;
 		bool g_CallbacksRegistered = false;
 	}
 
@@ -459,8 +605,10 @@ namespace hmd::steam
 		// enough to start receiving these.
 		g_JoinRequested.m_iCallback = kGameLobbyJoinRequested;
 		g_LobbyEnter.m_iCallback = kLobbyEnter;
+		g_SessionRequest.m_iCallback = kMessagesSessionRequest;
 		g_Api.RegisterCallback(&g_JoinRequested, kGameLobbyJoinRequested);
 		g_Api.RegisterCallback(&g_LobbyEnter, kLobbyEnter);
+		g_Api.RegisterCallback(&g_SessionRequest, kMessagesSessionRequest);
 		g_CallbacksRegistered = true;
 
 		g_Available = true;
@@ -482,6 +630,7 @@ namespace hmd::steam
 		{
 			g_Api.UnregisterCallback(&g_JoinRequested);
 			g_Api.UnregisterCallback(&g_LobbyEnter);
+			g_Api.UnregisterCallback(&g_SessionRequest);
 			g_CallbacksRegistered = false;
 		}
 
@@ -500,10 +649,37 @@ namespace hmd::steam
 		if (!g_Available)
 			return;
 
+		JoinLobbyFromCommandLine();
 		PollPendingLobbyCreate();
+
+		// Report the lobby's population whenever it changes. A session that
+		// never connects looks identical to one that was never attempted
+		// without this: the host just sits in "hosting" saying nothing, which
+		// is exactly what happened the first time this was tested.
+		if (g_Lobby && g_Api.GetNumLobbyMembers)
+		{
+			static int last_reported = -1;
+			const int members = g_Api.GetNumLobbyMembers(g_Matchmaking, g_Lobby);
+
+			if (members != last_reported)
+			{
+				last_reported = members;
+				LogInfo("steam: lobby now has %d member(s)%s", members,
+					members < 2 ? " - waiting for your friend to join" : "");
+			}
+		}
 
 		// A host sits in Hosting until someone actually arrives.
 		if (g_State == LobbyState::Hosting && g_Lobby &&
+			g_Api.GetNumLobbyMembers(g_Matchmaking, g_Lobby) > 1)
+		{
+			AdoptPeerFromLobby();
+		}
+
+		// A guest that entered the lobby but has not yet adopted the host -
+		// because the lobby's member list had not populated when LobbyEnter
+		// fired - keeps trying rather than sitting in Joining forever.
+		if (g_State == LobbyState::Joining && g_Lobby &&
 			g_Api.GetNumLobbyMembers(g_Matchmaking, g_Lobby) > 1)
 		{
 			AdoptPeerFromLobby();
@@ -614,6 +790,15 @@ namespace hmd::steam
 	std::string PeerName()
 	{
 		return g_PeerName;
+	}
+
+	std::string LocalName()
+	{
+		if (!g_Available || !g_Friends || !g_Api.GetPersonaName)
+			return {};
+
+		const char* name = g_Api.GetPersonaName(g_Friends);
+		return name ? std::string(name) : std::string{};
 	}
 
 	bool IsConnected()

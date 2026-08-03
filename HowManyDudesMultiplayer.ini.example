@@ -37,3 +37,31 @@ enable_discovery = true
 ; Set at most one of these, on the matching machine.
 auto_host = false
 auto_join = false
+
+; How many rounds between duels.
+;
+; Every this many rounds the boss fight is replaced by a fight against your
+; opponent's army. 20 is the length of an act, so by default the duel lands
+; exactly where the boss would have been.
+;
+; The two runs are not step-locked, so whoever reaches the duel round first
+; waits: the arena is held empty behind a "waiting for..." banner until the
+; other player gets there. If they never do, the duel is called off after five
+; minutes and the round is played normally.
+;
+; Both players should set the same value.
+duel_interval = 20
+
+; Pressing "start run" also starts your opponent's run, so you both drop into
+; a run together instead of coordinating it out loud. Either player starting
+; pulls the other in; whoever is already in a run is left alone.
+;
+; Turn off to start runs independently.
+sync_run_start = true
+
+; Show the mod's messages on screen, using the game's own message stream:
+; connecting, duels starting, lives lost, the final result.
+;
+; Turn off if it misbehaves. Everything the mod says still goes to aurie.log
+; either way, and F8 still prints a status line.
+on_screen_messages = true

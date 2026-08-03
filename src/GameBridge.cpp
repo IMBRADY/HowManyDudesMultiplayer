@@ -22,6 +22,9 @@ namespace hmd::bridge
 		std::set<std::string> g_MissingScripts;
 		std::map<std::string, int> g_AssetIndices;
 
+		// Scripts whose first unproven call has already been announced.
+		std::set<std::string> g_AnnouncedScripts;
+
 		bool ResolveScriptIndex(const std::string& ScriptName, int& Index)
 		{
 			if (!g_Api)
@@ -64,6 +67,7 @@ namespace hmd::bridge
 		g_ScriptPointers.clear();
 		g_MissingScripts.clear();
 		g_AssetIndices.clear();
+		g_AnnouncedScripts.clear();
 		return true;
 	}
 
@@ -139,6 +143,35 @@ namespace hmd::bridge
 	{
 		RValue discarded;
 		return CallScript(ScriptName, Arguments, discarded);
+	}
+
+	bool CallScriptAnnounced(
+		const std::string& ScriptName,
+		const std::vector<RValue>& Arguments,
+		RValue& Result
+	)
+	{
+		// Announce only the first call. After one has returned, the routine has
+		// demonstrated it is callable and the announcement is just noise.
+		if (!g_AnnouncedScripts.count(ScriptName))
+		{
+			g_AnnouncedScripts.insert(ScriptName);
+			LogInfo("first call to '%s' (%zu arg(s)) - if the game stops here, "
+				"this routine is not safe to call and the feature using it "
+				"needs disabling",
+				ScriptName.c_str(), Arguments.size());
+		}
+
+		return CallScript(ScriptName, Arguments, Result);
+	}
+
+	bool CallScriptAnnounced(
+		const std::string& ScriptName,
+		const std::vector<RValue>& Arguments
+	)
+	{
+		RValue discarded;
+		return CallScriptAnnounced(ScriptName, Arguments, discarded);
 	}
 
 	std::optional<RValue> CallBuiltin(
@@ -397,12 +430,29 @@ namespace hmd::bridge
 		LogInfo("--- members of %s ---", Label ? Label : "instance");
 
 		int printed = 0;
+		int skipped = 0;
 		g_Api->EnumInstanceMembers(
 			Instance,
-			[&printed](const char* MemberName, RValue* Value) -> bool
+			[&printed, &skipped](const char* MemberName, RValue* Value) -> bool
 			{
 				if (!MemberName)
 					return false;
+
+				// The global scope is dominated by the runtime's anonymous
+				// struct closures - "___struct___1234" and friends, thousands
+				// of them. They sort first alphabetically, so without this the
+				// listing cap is spent entirely on them and the dump never
+				// reaches a single name a human chose. That made this
+				// diagnostic worthless the first time it was needed.
+				// Returning true STOPS the enumeration - the callback is a
+				// search predicate, not a "keep going" flag. Skipping means
+				// returning false.
+				if (strncmp(MemberName, "___struct___", 12) == 0 ||
+					strncmp(MemberName, "gml_Script_", 11) == 0)
+				{
+					skipped++;
+					return false;
+				}
 
 				const char* kind = "?";
 				if (Value)
@@ -425,11 +475,87 @@ namespace hmd::bridge
 				printed++;
 
 				// Stop after a sane cap; some structs are enormous and this is
-				// a diagnostic, not a dump.
-				return printed >= 256;
+				// a diagnostic, not a dump. Raised well past the interesting
+				// range now that the runtime's own noise is filtered out.
+				return printed >= 600;
 			}
 		);
 
-		LogInfo("--- %d member(s) ---", printed);
+		LogInfo("--- %d member(s) listed, %d runtime-internal name(s) hidden ---",
+			printed, skipped);
+	}
+
+	void LogMatchingMembers(
+		const RValue& Instance,
+		const char* Label,
+		const std::vector<std::string>& Substrings
+	)
+	{
+		if (!g_Api)
+			return;
+
+		LogInfo("--- %s members matching the search ---",
+			Label ? Label : "instance");
+
+		int found = 0;
+		g_Api->EnumInstanceMembers(
+			Instance,
+			[&found, &Substrings](const char* MemberName, RValue* Value) -> bool
+			{
+				if (!MemberName)
+					return false;
+
+				// Case-insensitive containment against every term.
+				std::string lowered(MemberName);
+				for (char& character : lowered)
+					character = static_cast<char>(tolower(
+						static_cast<unsigned char>(character)));
+
+				bool matches = false;
+				for (const std::string& term : Substrings)
+				{
+					if (lowered.find(term) != std::string::npos)
+					{
+						matches = true;
+						break;
+					}
+				}
+
+				if (!matches)
+					return false;
+
+				// The value matters as much as the name here: the point is to
+				// spot which candidate actually holds the number we want, and
+				// a struct-valued global called "round_something" is not it.
+				if (Value && (Value->m_Kind == VALUE_REAL ||
+					Value->m_Kind == VALUE_INT32 ||
+					Value->m_Kind == VALUE_INT64 ||
+					Value->m_Kind == VALUE_BOOL))
+				{
+					LogInfo("    %-40s = %g", MemberName, Value->ToDouble());
+				}
+				else if (Value && Value->m_Kind == VALUE_STRING)
+				{
+					const char* text = Value->ToCString();
+					LogInfo("    %-40s = \"%.32s\"", MemberName, text ? text : "");
+				}
+				else
+				{
+					// Skipped, not printed. The overwhelming majority of
+					// matches are the game's own functions stored as global
+					// methods, and listing them spends the cap before the
+					// enumeration reaches the letter R - where every name
+					// worth having happens to start.
+					return false;
+				}
+
+				found++;
+
+				// Returning true STOPS enumeration; keep going until the cap.
+				return found >= 120;
+			}
+		);
+
+		LogInfo("--- %d match(es) ---", found);
 	}
 }

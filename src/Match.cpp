@@ -2,12 +2,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "Match.h"
 #include "GameBridge.h"
+#include "GameHooks.h"
 #include "Json.h"
 #include "Log.h"
 #include "Net.h"
+#include "RunState.h"
+#include "Sanitize.h"
+#include "Steam.h"
+#include "Ui.h"
 
 #include <atomic>
 #include <chrono>
+#include <mutex>
 
 using namespace YYTK;
 using namespace Aurie;
@@ -20,18 +26,21 @@ namespace hmd::match
 		constexpr const char* kKindArmy = "army";
 		constexpr const char* kKindResult = "result";
 		constexpr const char* kKindStatus = "status";
+		constexpr const char* kKindRunStart = "run_start";
 
 		// Scripts the mod intercepts. Names confirmed against data.win.
 		constexpr const char* kEndOfActScript = "gml_Script_victory_ui_round_finish";
 		constexpr const char* kWaveScript = "gml_Script_matchup_get_enemies_to_fit";
+		constexpr const char* kRunStartScript = "gml_Script_new_run_start";
+		constexpr const char* kJumpToRoundScript = "gml_Script_jump_to_round";
 
 		// How long to wait for the peer's army before giving up and letting the
-		// act resolve normally, so a dropped peer cannot soft-lock the run.
+		// round resolve normally, so a dropped peer cannot soft-lock the run.
 		//
 		// Five minutes is deliberately generous. The two runs are not step-locked
-		// - each player sends when their own act ends - so this window is what
-		// lets someone who is a little behind catch up rather than losing the
-		// exchange. The wait is not silent: progress is reported while it runs.
+		// - each player reaches the duel round in their own time - so this window
+		// is what lets someone who is a little behind catch up rather than losing
+		// the exchange. The wait is not silent: progress is reported while it runs.
 		constexpr auto kPeerTimeout = std::chrono::minutes(5);
 
 		// How often each side tells the other what it is doing, and how often
@@ -46,8 +55,19 @@ namespace hmd::match
 		// an opponent sitting in the menu.
 		constexpr auto kPresenceStaleAfter = std::chrono::seconds(10);
 
+		// While the arena is being held empty for a duel, the game may keep
+		// trying to populate it. Sweeping on an interval rather than every tick
+		// keeps that cheap.
+		constexpr auto kWaveClearInterval = std::chrono::milliseconds(500);
+
+		// The opponent's army has to actually appear before its absence can
+		// mean anything. Until it does, an empty arena means "not spawned yet",
+		// not "you won".
+		constexpr auto kInjectionSettleTime = std::chrono::seconds(2);
+
 		std::atomic<Phase> g_Phase{ Phase::Offline };
 		std::atomic<bool> g_ActEnded{ false };
+		std::atomic<bool> g_SyncRunStart{ true };
 
 		Lives g_Lives;
 		roster::Snapshot g_LocalArmy;
@@ -59,16 +79,60 @@ namespace hmd::match
 		bool g_PeerResultReceived = false;
 		bool g_PeerWonTheirFight = false;
 
+		// --- Duel state ---------------------------------------------------
+		// The round this duel is being fought at, and the last one that was
+		// seen through to a result. The second is what stops a finished duel
+		// from immediately re-triggering: the player is still standing on round
+		// 20 when it resolves.
+		int g_DuelRound = 0;
+		int g_CompletedDuelRound = 0;
+
+		// The progress value this duel is gated on. Compared against the peer's
+		// reported progress rather than against their round, because progress
+		// is defined on both clients whatever either could resolve.
+		int g_DuelProgress = 0;
+
+		std::chrono::steady_clock::time_point g_LastWaveClear;
+
+		// Set once the injected wave has actually been observed alive. Without
+		// it, the "no enemies left" test would fire on the empty arena that
+		// exists for a moment before the opponent's army spawns.
+		bool g_SawInjectedEnemies = false;
+		std::chrono::steady_clock::time_point g_InjectedAt;
+
+		// How long the opponent's in-run state must hold before it is announced
+		// to the player. Longer than any room transition, shorter than anyone
+		// would notice waiting.
+		constexpr auto kPresenceSettleTime = std::chrono::seconds(4);
+
 		// --- Presence -----------------------------------------------------
 		PeerPresence g_PeerPresence;
+
+		// Debounce state for the in-run announcement: what we last told the
+		// player, what the beacons are currently claiming, and since when.
+		bool g_PeerRunAnnounced = false;
+		bool g_PeerRunPending = false;
+		std::chrono::steady_clock::time_point g_PeerRunPendingSince;
 		std::chrono::steady_clock::time_point g_PeerPresenceAt;
 		std::chrono::steady_clock::time_point g_LastStatusSent;
 		std::chrono::steady_clock::time_point g_LastPresenceNag;
 		std::chrono::steady_clock::time_point g_LastWaitProgress;
 
+		// --- Run start sync -----------------------------------------------
+		// Filled by the peer, drained on the game thread. new_run_start must be
+		// called from the game's own thread, and messages arrive on the network
+		// worker, so the two are decoupled through here.
+		std::mutex g_RunStartMutex;
+		bool g_RunStartPending = false;
+		std::vector<RValue> g_RunStartArguments;
+
+		// True while we are replaying the peer's run start, so our own hook does
+		// not bounce it straight back at them.
+		std::atomic<bool> g_ReplayingRunStart{ false };
+
 		// --- Hook state ---------------------------------------------------
 		PFUNC_YYGMLScript g_EndOfActTrampoline = nullptr;
-		bool g_EndOfActHooked = false;
+		PFUNC_YYGMLScript g_RunStartTrampoline = nullptr;
 
 		void SetPhase(Phase NewPhase, const char* Reason)
 		{
@@ -81,20 +145,26 @@ namespace hmd::match
 			return bridge::CurrentRoomName() == "rm_gameplay";
 		}
 
-		// "In a run" means the arena is actually populated, not merely that the
-		// gameplay room is loaded - a room can be up for a moment before any
-		// dudes exist, and an army cannot be captured from an empty arena.
+		// "In a run" spans the whole run, not just the arena.
+		//
+		// This used to require rm_gameplay AND live o_dude instances, which is
+		// the right test for "can I capture an army right now" and the wrong
+		// one for "is this player in a run". Between rounds the player is in
+		// rm_ranch, so the strict test flickered false every single round - and
+		// each flicker announced "your opponent started a run" / "left their
+		// run" to the other player. That is the spam the tester saw.
+		//
+		// The ranch is part of a run. So is the arena before it has populated.
 		bool InRun()
 		{
-			return InGameplayRoom() && !bridge::FindInstances("o_dude").empty();
+			const std::string room = bridge::CurrentRoomName();
+			return room == "rm_gameplay" || room == "rm_ranch";
 		}
 
-		int LocalActNumber()
+		// The stricter test: an army can actually be read out of the arena.
+		bool ArenaIsPopulated()
 		{
-			RValue act;
-			if (bridge::CallScript("gml_Script_get_act_number", {}, act))
-				return act.ToInt32();
-			return 0;
+			return InGameplayRoom() && !bridge::FindInstances("o_dude").empty();
 		}
 
 		// True when the peer has reported recently enough to be believed.
@@ -108,90 +178,31 @@ namespace hmd::match
 		{
 			g_PeerPresence = PeerPresence{};
 			g_PeerPresenceAt = {};
+			g_PeerRunAnnounced = false;
+			g_PeerRunPending = false;
+			g_PeerRunPendingSince = {};
+		}
+
+		// How the opponent should be referred to on screen. Their own reported
+		// name first, then whatever Steam told us, then something neutral.
+		std::string PeerLabel()
+		{
+			if (!g_PeerPresence.name.empty())
+				return g_PeerPresence.name;
+
+			const std::string steam_name = steam::PeerName();
+			if (!steam_name.empty())
+				return steam_name;
+
+			return "your opponent";
 		}
 
 		// -----------------------------------------------------------------
-		// Hook
+		// Hooks
 		// -----------------------------------------------------------------
-		//
-		// Resolve a script's YYC entry point. GetNamedRoutinePointer hands back
-		// a CScript*, and the native function lives at m_Functions->
-		// m_ScriptFunction. Those offsets come from YYTK's struct definitions,
-		// which are only correct if this runner matches what YYTK expects - so
-		// before trusting any of it, we read CScript::m_Name back and require it
-		// to equal the name we asked for. If the layout were wrong, that string
-		// compare would fail (or the pointer would be unreadable) and we bail
-		// out rather than hooking a bogus address.
-		// What a guarded probe of a CScript found. Plain data only - this is
-		// filled inside an SEH block, which cannot coexist with locals that
-		// need C++ unwinding.
-		struct ScriptProbe
-		{
-			bool faulted;
-			const char* name;
-			PFUNC_YYGMLScript entry;
-		};
-
-		ScriptProbe ProbeScript(void* Raw)
-		{
-			ScriptProbe probe{ false, nullptr, nullptr };
-
-			__try
-			{
-				CScript* script = static_cast<CScript*>(Raw);
-				probe.name = script->m_Name;
-
-				YYGMLFuncs* functions = script->m_Functions;
-				if (functions)
-					probe.entry = functions->m_ScriptFunction;
-			}
-			__except (EXCEPTION_EXECUTE_HANDLER)
-			{
-				probe.faulted = true;
-				probe.name = nullptr;
-				probe.entry = nullptr;
-			}
-
-			return probe;
-		}
-
-		PFUNC_YYGMLScript ResolveScriptEntryPoint(const char* ScriptName)
-		{
-			void* raw = bridge::ScriptPointer(ScriptName);
-			if (!raw)
-				return nullptr;
-
-			ScriptProbe probe = ProbeScript(raw);
-
-			if (probe.faulted)
-			{
-				LogWarn("faulted while reading CScript for '%s' - refusing to hook",
-					ScriptName);
-				return nullptr;
-			}
-
-			// Layout sanity check: if the struct offsets were wrong for this
-			// runner, m_Name would not read back as the name we looked up.
-			if (!probe.name || strcmp(probe.name, ScriptName) != 0)
-			{
-				LogWarn("CScript layout check failed for '%s' (got '%s') - "
-					"refusing to hook", ScriptName,
-					probe.name ? probe.name : "<null>");
-				return nullptr;
-			}
-
-			if (!probe.entry)
-			{
-				LogWarn("'%s' has no YYC entry point - refusing to hook", ScriptName);
-				return nullptr;
-			}
-
-			return probe.entry;
-		}
 
 		// Our replacement for victory_ui_round_finish. It does the minimum
-		// possible: note that the act ended, then run the original. All the
-		// real work is deferred to Tick() on the next frame.
+		// possible: note that a round ended, then run the original.
 		RValue& EndOfActDetour(
 			CInstance* Self,
 			CInstance* Other,
@@ -200,6 +211,11 @@ namespace hmd::match
 			RValue* Arguments[]
 		)
 		{
+			// This is a ROUND finish, not an act finish - the script's own name
+			// says so, and the logs confirm it fires after round 1. Treating it
+			// as an act boundary is what made the very first duel trigger on
+			// round 2 instead of round 20. It is now what counts rounds.
+			runstate::NoteRoundFinished();
 			SignalActEnded();
 
 			if (!g_EndOfActTrampoline)
@@ -213,35 +229,172 @@ namespace hmd::match
 			return g_EndOfActTrampoline(Self, Other, Result, ArgumentCount, Arguments);
 		}
 
-		bool InstallEndOfActHook(AurieModule* Module)
+		// Convert a hook argument into something that survives the wire. Only
+		// scalars do; a struct argument is a run configuration we have no way to
+		// rebuild on the far side, and saying so is better than sending a
+		// half-formed one.
+		bool SerializeRunStartArguments(
+			int ArgumentCount,
+			RValue* Arguments[],
+			json::Value& Out
+		)
 		{
-			PFUNC_YYGMLScript target = ResolveScriptEntryPoint(kEndOfActScript);
-			if (!target)
+			Out = json::Value::Array();
+
+			for (int i = 0; i < ArgumentCount; i++)
 			{
-				LogWarn("end-of-act hook unavailable - falling back to frame "
-					"polling for act detection");
-				return false;
+				const RValue* argument = hooks::Argument(ArgumentCount, Arguments, i);
+				if (!argument)
+					return false;
+
+				switch (argument->m_Kind)
+				{
+				case VALUE_REAL:
+				case VALUE_INT32:
+				case VALUE_INT64:
+				case VALUE_BOOL:
+					Out.Push(json::Value(argument->ToDouble()));
+					break;
+
+				case VALUE_STRING:
+				{
+					const char* text = argument->ToCString();
+					Out.Push(json::Value(text ? std::string(text) : std::string{}));
+					break;
+				}
+
+				case VALUE_UNDEFINED:
+					// Replayable: GML treats a missing argument as undefined
+					// anyway, so dropping it reproduces the same call.
+					Out.Push(json::Value());
+					break;
+
+				default:
+					return false;
+				}
 			}
 
-			PVOID trampoline = nullptr;
-			AurieStatus status = MmCreateHook(
-				Module,
-				"hmd_end_of_act",
-				reinterpret_cast<PVOID>(target),
-				reinterpret_cast<PVOID>(&EndOfActDetour),
-				&trampoline
-			);
+			return true;
+		}
 
-			if (!AurieSuccess(status) || !trampoline)
+		// Feature 1: pressing "start run" pulls the opponent in too.
+		RValue& RunStartDetour(
+			CInstance* Self,
+			CInstance* Other,
+			RValue& Result,
+			int ArgumentCount,
+			RValue* Arguments[]
+		)
+		{
+			HMD_LOG_SIGNATURE_ONCE(kRunStartScript, ArgumentCount, Arguments, nullptr);
+
+			// Round 1 starts here, however the run was started.
+			runstate::NoteRunStarted();
+
+			// A run we started because the peer told us to must not be echoed
+			// back, or the two clients would bounce starts off each other.
+			const bool replaying = g_ReplayingRunStart.load();
+
+			if (!replaying && g_SyncRunStart.load() && net::IsConnected())
 			{
-				LogWarn("MmCreateHook failed for '%s' (status %d) - falling back "
-					"to frame polling", kEndOfActScript, static_cast<int>(status));
-				return false;
+				json::Value arguments;
+				const bool replayable =
+					SerializeRunStartArguments(ArgumentCount, Arguments, arguments);
+
+				json::Value root;
+				root.Set("kind", json::Value(kKindRunStart));
+				root.Set("replayable", json::Value(replayable));
+				if (replayable)
+					root.Set("args", arguments);
+
+				if (!replayable)
+				{
+					LogWarn("new_run_start was called with an argument this mod "
+						"cannot forward - your opponent will be started with the "
+						"game's defaults instead");
+				}
+
+				net::Send(root.Serialize());
+				ui::Notify("Starting a run - pulling %s in too.",
+					PeerLabel().c_str());
 			}
 
-			g_EndOfActTrampoline = reinterpret_cast<PFUNC_YYGMLScript>(trampoline);
-			g_EndOfActHooked = true;
-			LogInfo("hooked %s", kEndOfActScript);
+			if (!g_RunStartTrampoline)
+			{
+				Result = RValue();
+				return Result;
+			}
+
+			return g_RunStartTrampoline(Self, Other, Result, ArgumentCount, Arguments);
+		}
+
+		// Perform a run start the peer asked for. Called from Tick, on the
+		// game's own thread - new_run_start changes rooms and rebuilds the run,
+		// which is not something to do from a network worker.
+		void DrainPendingRunStart()
+		{
+			std::vector<RValue> arguments;
+
+			{
+				std::lock_guard<std::mutex> lock(g_RunStartMutex);
+				if (!g_RunStartPending)
+					return;
+
+				g_RunStartPending = false;
+				arguments = std::move(g_RunStartArguments);
+				g_RunStartArguments.clear();
+			}
+
+			// Never yank someone out of a run they are already playing.
+			if (InRun())
+			{
+				LogWarn("your opponent started a run, but you are already in one "
+					"- staying where you are");
+				return;
+			}
+
+			if (!bridge::ScriptExists(kRunStartScript))
+			{
+				LogWarn("cannot start a run to match your opponent - '%s' did not "
+					"resolve", kRunStartScript);
+				return;
+			}
+
+			ui::Notify("%s started a run - starting yours.", PeerLabel().c_str());
+
+			g_ReplayingRunStart.store(true);
+			const bool started =
+				bridge::CallScriptAnnounced(kRunStartScript, arguments);
+			g_ReplayingRunStart.store(false);
+
+			if (!started)
+			{
+				LogWarn("the synced run start did not take - start your run "
+					"manually and the duel will still work");
+			}
+		}
+
+		bool InstallHooks(AurieModule* Module)
+		{
+			g_EndOfActTrampoline = hooks::Install(
+				Module, "hmd_end_of_act", kEndOfActScript, &EndOfActDetour);
+
+			if (!g_EndOfActTrampoline)
+			{
+				LogWarn("end-of-round hook unavailable - duels will still trigger "
+					"from the round number, this only costs a little accuracy in "
+					"detecting when a round finished");
+			}
+
+			g_RunStartTrampoline = hooks::Install(
+				Module, "hmd_run_start", kRunStartScript, &RunStartDetour);
+
+			if (!g_RunStartTrampoline)
+			{
+				LogWarn("run-start hook unavailable - starting a run will not "
+					"pull your opponent in; you will both need to press start");
+			}
+
 			return true;
 		}
 
@@ -261,15 +414,18 @@ namespace hmd::match
 		}
 
 		// Lightweight presence beacon: what this client is doing right now, so
-		// the other side can say "waiting for your opponent to start a run"
-		// instead of sitting silent.
+		// the other side can report it, place the marker on their round track,
+		// and know when both players have reached the duel round.
 		std::string BuildStatusMessage()
 		{
 			json::Value root;
 			root.Set("kind", json::Value(kKindStatus));
 			root.Set("in_run", json::Value(InRun()));
-			root.Set("act", json::Value(LocalActNumber()));
+			root.Set("act", json::Value(runstate::CurrentAct()));
+			root.Set("round", json::Value(runstate::CurrentRound()));
+			root.Set("progress", json::Value(runstate::CurrentProgress()));
 			root.Set("phase", json::Value(PhaseName()));
+			root.Set("name", json::Value(steam::LocalName()));
 			return root.Serialize();
 		}
 
@@ -282,6 +438,56 @@ namespace hmd::match
 			root.Set("won", json::Value(LocalWon));
 			root.Set("lives", json::Value(g_Lives.local));
 			return root.Serialize();
+		}
+
+		void HandleRunStartMessage(const json::Value& Root)
+		{
+			if (!g_SyncRunStart.load())
+				return;
+
+			std::vector<RValue> arguments;
+
+			if (Root["replayable"].AsBool())
+			{
+				const json::Value& array = Root["args"];
+				if (array.IsArray())
+				{
+					// A run start takes a handful of arguments at most. A peer
+					// claiming otherwise is not one this mod built.
+					constexpr size_t kMaxArguments = 16;
+
+					for (const json::Value& item : array.Items())
+					{
+						if (arguments.size() >= kMaxArguments)
+						{
+							LogWarn("peer sent %zu run-start arguments - ignoring "
+								"the rest", array.Size());
+							break;
+						}
+
+						switch (item.GetType())
+						{
+						case json::Type::Number:
+							arguments.push_back(RValue(item.AsNumber()));
+							break;
+						case json::Type::Bool:
+							arguments.push_back(RValue(item.AsBool()));
+							break;
+						case json::Type::String:
+							arguments.push_back(
+								RValue(sanitize::ClampText(item.AsString())));
+							break;
+						default:
+							arguments.push_back(RValue());
+							break;
+						}
+					}
+				}
+			}
+
+			std::lock_guard<std::mutex> lock(g_RunStartMutex);
+			g_RunStartPending = true;
+			g_RunStartArguments = std::move(arguments);
 		}
 
 		void HandleMessage(const std::string& Text)
@@ -318,15 +524,46 @@ namespace hmd::match
 				g_PeerPresence.known = true;
 				g_PeerPresence.in_run = root["in_run"].AsBool();
 				g_PeerPresence.act = root["act"].AsInt(0);
+				g_PeerPresence.round = static_cast<int>(
+					sanitize::ClampNumber(root["round"].AsInt(0), 0.0, 1000.0));
+				g_PeerPresence.progress = static_cast<int>(
+					sanitize::ClampNumber(root["progress"].AsInt(0), 0.0, 1000.0));
+				g_PeerPresence.name = sanitize::ClampText(root["name"].AsString());
 				g_PeerPresenceAt = std::chrono::steady_clock::now();
 
-				// Only announce the transition, not every beacon.
-				if (!was_in_run && g_PeerPresence.in_run)
-					LogInfo("your opponent has started a run (act %d)",
-						g_PeerPresence.act);
-				else if (was_in_run && !g_PeerPresence.in_run)
-					LogInfo("your opponent has left their run");
+				UNREFERENCED_PARAMETER(was_in_run);
 
+				// Announce only a change that has held for a while.
+				//
+				// Reporting every transition meant announcing "started a run"
+				// and "left their run" over and over, because the old in-run
+				// test went false every time the opponent passed through the
+				// ranch between rounds. That test is fixed, but the debounce
+				// stays: a room transition should never be able to spam the
+				// other player, however brief.
+				const auto now = std::chrono::steady_clock::now();
+
+				if (g_PeerPresence.in_run != g_PeerRunPending)
+				{
+					g_PeerRunPending = g_PeerPresence.in_run;
+					g_PeerRunPendingSince = now;
+				}
+				else if (g_PeerRunPending != g_PeerRunAnnounced &&
+					(now - g_PeerRunPendingSince) >= kPresenceSettleTime)
+				{
+					g_PeerRunAnnounced = g_PeerRunPending;
+
+					ui::Notify(g_PeerRunAnnounced
+						? "%s started a run."
+						: "%s left their run.", PeerLabel().c_str());
+				}
+
+				return;
+			}
+
+			if (kind == kKindRunStart)
+			{
+				HandleRunStartMessage(root);
 				return;
 			}
 
@@ -359,8 +596,33 @@ namespace hmd::match
 			std::vector<RValue> enemies = bridge::FindInstances("o_enemy");
 			std::vector<RValue> dudes = bridge::FindInstances("o_dude");
 
+			// The opponent's army has to have been seen alive before its
+			// absence can mean a win. Injection is not instantaneous, and the
+			// arena is legitimately empty for a moment either side of it - which
+			// is exactly the window that used to be misread as an instant
+			// victory, and which the duel gate would otherwise fall straight
+			// through.
+			if (!enemies.empty())
+				g_SawInjectedEnemies = true;
+
+			if (!g_SawInjectedEnemies)
+			{
+				const auto waited = std::chrono::steady_clock::now() - g_InjectedAt;
+				if (waited > kInjectionSettleTime)
+				{
+					// Nothing ever spawned to fight. Awarding the round rather
+					// than hanging is the only option that keeps the run
+					// playable, and it is logged as the anomaly it is.
+					LogWarn("the opponent's army never appeared in the arena - "
+						"awarding the duel so the run can continue");
+					return Outcome::LocalWon;
+				}
+
+				return Outcome::Undecided;
+			}
+
 			if (enemies.empty() && dudes.empty())
-				return Outcome::Undecided; // Arena not populated yet.
+				return Outcome::Undecided; // Arena torn down, not a result.
 
 			if (enemies.empty())
 				return Outcome::LocalWon;
@@ -370,7 +632,7 @@ namespace hmd::match
 			for (const RValue& dude : dudes)
 			{
 				RValue knocked;
-				if (bridge::CallScript("gml_Script_dude_is_knocked_out", { dude }, knocked))
+				if (bridge::CallScriptAnnounced("gml_Script_dude_is_knocked_out", { dude }, knocked))
 				{
 					if (!knocked.ToBoolean())
 					{
@@ -395,12 +657,12 @@ namespace hmd::match
 			if (!LocalWon)
 			{
 				g_Lives.local--;
-				LogStage(kStageResolve, "local player lost a life (%d remaining)",
-					g_Lives.local);
+				ui::Notify("You lost the duel. %d %s left.",
+					g_Lives.local, g_Lives.local == 1 ? "life" : "lives");
 			}
 			else
 			{
-				LogStage(kStageResolve, "local player won the exchange");
+				ui::Notify("You beat %s's army!", PeerLabel().c_str());
 			}
 
 			if (!g_ResultSent)
@@ -408,6 +670,85 @@ namespace hmd::match
 				net::Send(BuildResultMessage(LocalWon));
 				g_ResultSent = true;
 			}
+		}
+
+		// -----------------------------------------------------------------
+		// Duel gate
+		// -----------------------------------------------------------------
+
+		// Hold the arena empty while waiting for the opponent. The game will
+		// keep trying to populate a boss round, so this is swept rather than
+		// done once.
+		void HoldArenaEmpty(std::chrono::steady_clock::time_point Now)
+		{
+			if (Now - g_LastWaveClear < kWaveClearInterval)
+				return;
+
+			g_LastWaveClear = Now;
+			roster::ClearDefaultEnemyWave();
+		}
+
+		// Give the round back to the game after a gate times out. The boss was
+		// cleared to make room for a duel that never happened, so the round is
+		// rebuilt through the game's own round jump rather than left empty.
+		void AbandonDuel(const char* Reason)
+		{
+			ui::Notify("Duel called off - %s. Playing round %d normally.",
+				Reason, g_DuelRound);
+
+			roster::SetDefaultWaveSuppressed(false);
+
+			if (g_DuelRound > 0 && bridge::ScriptExists(kJumpToRoundScript))
+			{
+				// Re-entering the round regenerates the wave we cleared. Without
+				// this the player would be left standing in an empty arena with
+				// nothing to fight and no way to finish the round.
+				if (!bridge::CallScriptAnnounced(
+						kJumpToRoundScript,
+						{ RValue(static_cast<double>(g_DuelRound)) }))
+				{
+					LogWarn("could not rebuild round %d - if the arena is empty, "
+						"leave the run and start a new one", g_DuelRound);
+				}
+			}
+			else if (g_DuelRound > 0)
+			{
+				LogWarn("'%s' did not resolve - round %d may be left without a "
+					"wave", kJumpToRoundScript, g_DuelRound);
+			}
+
+			// Do not immediately re-enter the gate on the same round.
+			g_CompletedDuelRound = g_DuelRound;
+			g_DuelRound = 0;
+		}
+
+		// Publish what the overlay should be drawing.
+		void PushOverlay(const std::string& Banner)
+		{
+			ui::Overlay overlay;
+			overlay.connected = net::IsConnected();
+
+			int tracked = 0;
+
+			if (overlay.connected)
+			{
+				const PeerPresence presence = CurrentPeerPresence();
+				overlay.peer_name = !presence.name.empty()
+					? presence.name
+					: steam::PeerName();
+				overlay.peer_round = presence.round;
+				overlay.peer_in_run = presence.in_run;
+				overlay.banner = Banner;
+
+				if (presence.in_run)
+					tracked = presence.round;
+			}
+
+			// Tell the run map which cell is worth measuring. Exactly one is:
+			// the one the opponent is standing on.
+			runstate::SetTrackedRound(tracked);
+
+			ui::SetOverlay(overlay);
 		}
 	}
 
@@ -419,9 +760,7 @@ namespace hmd::match
 		g_Lives = Lives{};
 		ResetMatchState();
 
-		// The hook is an optimisation over polling, not a requirement. If it
-		// cannot be installed safely the mod still works.
-		InstallEndOfActHook(Module);
+		InstallHooks(Module);
 
 		if (!bridge::ScriptExists(kWaveScript))
 		{
@@ -435,11 +774,19 @@ namespace hmd::match
 
 	void Shutdown(AurieModule* Module)
 	{
-		if (g_EndOfActHooked && Module)
+		if (Module)
 		{
-			MmRemoveHook(Module, "hmd_end_of_act");
-			g_EndOfActHooked = false;
-			g_EndOfActTrampoline = nullptr;
+			if (g_EndOfActTrampoline)
+			{
+				hooks::Remove(Module, "hmd_end_of_act");
+				g_EndOfActTrampoline = nullptr;
+			}
+
+			if (g_RunStartTrampoline)
+			{
+				hooks::Remove(Module, "hmd_run_start");
+				g_RunStartTrampoline = nullptr;
+			}
 		}
 
 		roster::SetDefaultWaveSuppressed(false);
@@ -460,16 +807,33 @@ namespace hmd::match
 		g_ResultSent = false;
 		g_PeerResultReceived = false;
 		g_PeerWonTheirFight = false;
+		g_DuelRound = 0;
+		g_CompletedDuelRound = 0;
+		g_DuelProgress = 0;
+		g_SawInjectedEnemies = false;
 		ForgetPeerPresence();
 		g_LastStatusSent = {};
 		g_LastPresenceNag = {};
 		g_LastWaitProgress = {};
+		g_LastWaveClear = {};
+
+		{
+			std::lock_guard<std::mutex> lock(g_RunStartMutex);
+			g_RunStartPending = false;
+			g_RunStartArguments.clear();
+		}
+
 		roster::SetDefaultWaveSuppressed(false);
 	}
 
 	void SignalActEnded()
 	{
 		g_ActEnded.store(true);
+	}
+
+	void SetSyncRunStart(bool Enabled)
+	{
+		g_SyncRunStart.store(Enabled);
 	}
 
 	bool ShouldSuppressDefaultWave()
@@ -486,14 +850,15 @@ namespace hmd::match
 	{
 		switch (g_Phase.load())
 		{
-		case Phase::Offline:      return "offline";
-		case Phase::Idle:         return "idle";
-		case Phase::Capturing:    return "capturing";
-		case Phase::AwaitingPeer: return "awaiting-peer";
-		case Phase::Injecting:    return "injecting";
-		case Phase::Fighting:     return "fighting";
-		case Phase::Resolving:    return "resolving";
-		case Phase::GameOver:     return "game-over";
+		case Phase::Offline:           return "offline";
+		case Phase::Idle:              return "idle";
+		case Phase::AwaitingPeerRound: return "awaiting-peer-round";
+		case Phase::Capturing:         return "capturing";
+		case Phase::AwaitingPeer:      return "awaiting-peer";
+		case Phase::Injecting:         return "injecting";
+		case Phase::Fighting:          return "fighting";
+		case Phase::Resolving:         return "resolving";
+		case Phase::GameOver:          return "game-over";
 		}
 		return "unknown";
 	}
@@ -517,6 +882,18 @@ namespace hmd::match
 		return InRun();
 	}
 
+	void Report()
+	{
+		LogInfo("probe: match phase=%s duel_round=%d completed=%d "
+			"sync_run_start=%d hooks: end_of_round=%s run_start=%s",
+			PhaseName(),
+			g_DuelRound,
+			g_CompletedDuelRound,
+			g_SyncRunStart.load() ? 1 : 0,
+			g_EndOfActTrampoline ? "yes" : "no",
+			g_RunStartTrampoline ? "yes" : "no");
+	}
+
 	void Tick()
 	{
 		// Always drain the network queue, whatever phase we are in, so peer
@@ -524,6 +901,9 @@ namespace hmd::match
 		std::string message;
 		while (net::Poll(message))
 			HandleMessage(message);
+
+		// A run the peer asked for is started here, on the game's thread.
+		DrainPendingRunStart();
 
 		const Phase phase = g_Phase.load();
 
@@ -538,16 +918,16 @@ namespace hmd::match
 			{
 				if (phase != Phase::GameOver)
 				{
-					LogStage(kStageResolve,
-						"peer disconnected - the match is over. Lives were "
-						"local %d, remote %d. Reconnecting starts a new match.",
-						g_Lives.local, g_Lives.remote);
+					ui::Notify("Your opponent disconnected - the match is over "
+						"(lives were %d to %d).", g_Lives.local, g_Lives.remote);
 				}
 
 				roster::SetDefaultWaveSuppressed(false);
 				ResetMatchState();
 				SetPhase(Phase::Offline, "peer link lost - match ended");
 			}
+
+			PushOverlay({});
 			return;
 		}
 
@@ -556,13 +936,20 @@ namespace hmd::match
 			// Every connection is a new match, by design.
 			ResetMatchState();
 			SetPhase(Phase::Idle, "peer link established - new match, 3 lives each");
+			ui::Notify("Connected to %s. 3 lives each - duels every %d rounds.",
+				PeerLabel().c_str(), runstate::DuelInterval());
+			PushOverlay({});
 			return;
 		}
 
 		if (phase == Phase::GameOver)
+		{
+			PushOverlay({});
 			return;
+		}
 
-		// Tell the peer what we are doing, so their client can report it.
+		// Tell the peer what we are doing, so their client can report it and
+		// place our marker on their round track.
 		const auto now = std::chrono::steady_clock::now();
 		if (now - g_LastStatusSent >= kStatusSendInterval)
 		{
@@ -570,10 +957,71 @@ namespace hmd::match
 			net::Send(BuildStatusMessage());
 		}
 
+		std::string banner;
+
 		switch (phase)
 		{
 		case Phase::Idle:
 		{
+			const int round = runstate::CurrentRound();
+			const bool tracked = runstate::RoundTrackingAvailable();
+
+			// Two ways in, depending on what this build could resolve.
+			//
+			// With a real round number, the duel triggers on the duel round
+			// itself, which is what replaces the boss fight.
+			//
+			// Without one, the act-end hook is the fallback: an act is exactly
+			// one duel interval of rounds and ends in the boss, so firing on
+			// the act boundary lands on the same fight. It is a round late
+			// rather than at the start of the round, which is the cost of not
+			// knowing the number.
+			const bool round_trigger =
+				tracked && round > 0 && round != g_CompletedDuelRound &&
+				runstate::IsDuelRound(round);
+
+			const bool act_trigger = !tracked && g_ActEnded.load();
+
+			// The arena has to be populated, not merely the run in progress:
+			// the duel captures an army immediately, and there is none to
+			// capture from the ranch between rounds.
+			if ((round_trigger || act_trigger) && ArenaIsPopulated())
+			{
+				g_ActEnded.store(false);
+				g_DuelRound = round > 0 ? round : runstate::CurrentProgress();
+				g_DuelProgress = runstate::CurrentProgress();
+				g_SawInjectedEnemies = false;
+				g_WaitStarted = now;
+				g_LastWaveClear = {};
+
+				HoldArenaEmpty(now);
+
+				if (g_DuelRound > 0)
+				{
+					ui::Notify("Round %d - duel round. No boss: you fight %s.",
+						g_DuelRound, PeerLabel().c_str());
+				}
+				else
+				{
+					ui::Notify("Duel round. No boss: you fight %s.",
+						PeerLabel().c_str());
+				}
+
+				SetPhase(Phase::AwaitingPeerRound, "duel round reached");
+				break;
+			}
+
+			// A round that is not a duel round clears the guard, so the next
+			// one can trigger.
+			if (tracked && round > 0 && !runstate::IsDuelRound(round))
+				g_CompletedDuelRound = 0;
+
+			// Back at the menu with a round still counted means the run ended -
+			// abandoned, lost, or finished. Stop reporting a round, so the next
+			// run starts counting from 1 rather than continuing.
+			if (round > 0 && bridge::CurrentRoomName() == "rm_mainmenu")
+				runstate::NoteRunEnded();
+
 			// Neither side can exchange anything until both are actually in a
 			// run. Say so periodically rather than leaving the player guessing.
 			if (now - g_LastPresenceNag >= kPresenceNagInterval)
@@ -584,64 +1032,118 @@ namespace hmd::match
 				if (local_in_run && !peer_in_run)
 				{
 					g_LastPresenceNag = now;
-					LogInfo("waiting for your opponent to start a run - armies "
-						"are exchanged when you both finish an act");
+					LogInfo("waiting for your opponent to start a run - the duel "
+						"happens when you both reach round %d",
+						runstate::NextDuelRound(round));
 				}
 				else if (!local_in_run && peer_in_run)
 				{
 					g_LastPresenceNag = now;
-					LogInfo("your opponent is in a run (act %d) - start yours to "
-						"play against them", g_PeerPresence.act);
+					LogInfo("your opponent is in a run (round %d) - start yours "
+						"to play against them", g_PeerPresence.round);
 				}
 			}
 
-			if (!g_ActEnded.load())
-				return;
+			// In round-tracked mode the act-end signal is not what triggers a
+			// duel, so it is cleared rather than left to accumulate. In
+			// fallback mode it IS the trigger, and it is deliberately left
+			// pending until the arena has populated enough to act on - dropping
+			// it here would lose the only signal that build gets.
+			if (tracked)
+				g_ActEnded.store(false);
+			break;
+		}
 
-			g_ActEnded.store(false);
+		case Phase::AwaitingPeerRound:
+		{
+			// The arena stays empty until the opponent arrives. Without this
+			// the boss the duel replaces would fight the player while they
+			// wait.
+			HoldArenaEmpty(now);
 
-			if (!InGameplayRoom())
+			// Compared on progress rather than on round, because progress is
+			// the one measure both clients can always produce - the opponent
+			// may be a build, or a machine, where the round number never
+			// resolved.
+			const bool peer_ready =
+				PeerPresenceFresh() &&
+				g_PeerPresence.in_run &&
+				g_PeerPresence.progress >= g_DuelProgress;
+
+			if (peer_ready)
 			{
-				LogWarn("act-end signalled outside rm_gameplay - ignoring");
-				return;
+				ui::Notify("%s is here - duel!", PeerLabel().c_str());
+				SetPhase(Phase::Capturing, "both players at the duel round");
+				break;
 			}
 
-			SetPhase(Phase::Capturing, "act ended");
-			return;
+			const auto waited = now - g_WaitStarted;
+
+			if (waited > kPeerTimeout)
+			{
+				AbandonDuel("your opponent never reached this round");
+				SetPhase(Phase::Idle, "duel gate timed out");
+				break;
+			}
+
+			// The banner is the whole point of the gate being visible: an empty
+			// arena with no explanation reads as a bug.
+			char text[192]{};
+			if (PeerPresenceFresh() && g_PeerPresence.in_run)
+			{
+				_snprintf_s(text, sizeof(text) - 1, _TRUNCATE,
+					"WAITING FOR %s - ROUND %d OF %d",
+					PeerLabel().c_str(),
+					g_PeerPresence.progress, g_DuelProgress);
+			}
+			else
+			{
+				_snprintf_s(text, sizeof(text) - 1, _TRUNCATE,
+					"WAITING FOR %s TO START A RUN", PeerLabel().c_str());
+			}
+			banner = text;
+
+			if (now - g_LastWaitProgress >= kWaitProgressInterval)
+			{
+				g_LastWaitProgress = now;
+				const auto remaining = std::chrono::duration_cast<
+					std::chrono::seconds>(kPeerTimeout - waited).count();
+				LogInfo("duel gate: %s (%llds before giving up)",
+					banner.c_str(), static_cast<long long>(remaining));
+			}
+			break;
 		}
 
 		case Phase::Capturing:
 		{
-			// Halt normal act progression while the exchange happens.
+			// Halt normal progression while the exchange happens.
 			roster::SetDefaultWaveSuppressed(true);
+			HoldArenaEmpty(now);
 
 			if (!roster::CaptureLocalArmy(g_LocalArmy))
 			{
-				// Nothing to send. Let the act proceed vanilla rather than
+				// Nothing to send. Let the round proceed vanilla rather than
 				// stalling the run.
-				roster::SetDefaultWaveSuppressed(false);
+				AbandonDuel("your army could not be captured");
 				SetPhase(Phase::Idle, "army capture failed");
-				return;
+				break;
 			}
 
 			g_LocalArmy.lives = g_Lives.local;
-
-			RValue act_number;
-			if (bridge::CallScript("gml_Script_get_act_number", {}, act_number))
-				g_LocalArmy.act = act_number.ToInt32();
+			g_LocalArmy.act = runstate::CurrentAct();
 
 			const std::string payload = BuildArmyMessage(g_LocalArmy);
 			if (payload.empty() || !net::Send(payload))
 			{
-				roster::SetDefaultWaveSuppressed(false);
+				AbandonDuel("your army could not be sent");
 				SetPhase(Phase::Idle, "could not transmit army");
-				return;
+				break;
 			}
 
 			LogStage(kStageSerialize, "transmitted %zu byte army payload",
 				payload.size());
 
-			g_WaitStarted = std::chrono::steady_clock::now();
+			g_WaitStarted = now;
 
 			// The peer's army may already have arrived while we were capturing.
 			SetPhase(
@@ -650,60 +1152,33 @@ namespace hmd::match
 					: Phase::Injecting,
 				"local army sent"
 			);
-			return;
+			break;
 		}
 
 		case Phase::AwaitingPeer:
 		{
+			HoldArenaEmpty(now);
+
 			const auto waited = now - g_WaitStarted;
 
 			if (waited > kPeerTimeout)
 			{
-				LogWarn("your opponent did not finish an act within %lld minutes "
-					"- playing this act normally",
-					static_cast<long long>(
-						std::chrono::duration_cast<std::chrono::minutes>(
-							kPeerTimeout).count()));
-				roster::SetDefaultWaveSuppressed(false);
+				AbandonDuel("your opponent's army never arrived");
 				SetPhase(Phase::Idle, "peer timeout");
-				return;
+				break;
 			}
 
-			// A five minute wait must not look like a hang. Report progress,
-			// and say specifically what the opponent is doing when we know.
+			banner = "EXCHANGING ARMIES...";
+
 			if (now - g_LastWaitProgress >= kWaitProgressInterval)
 			{
 				g_LastWaitProgress = now;
-
 				const auto elapsed = std::chrono::duration_cast<
 					std::chrono::seconds>(waited).count();
-				const auto remaining = std::chrono::duration_cast<
-					std::chrono::seconds>(kPeerTimeout - waited).count();
-
-				if (!PeerPresenceFresh())
-				{
-					LogInfo("waiting for your opponent's army - no word from "
-						"them for a while (%llds elapsed, %llds left)",
-						static_cast<long long>(elapsed),
-						static_cast<long long>(remaining));
-				}
-				else if (!g_PeerPresence.in_run)
-				{
-					LogInfo("waiting for your opponent to start a run "
-						"(%llds elapsed, %llds left)",
-						static_cast<long long>(elapsed),
-						static_cast<long long>(remaining));
-				}
-				else
-				{
-					LogInfo("waiting for your opponent to finish act %d "
-						"(%llds elapsed, %llds left)",
-						g_PeerPresence.act,
-						static_cast<long long>(elapsed),
-						static_cast<long long>(remaining));
-				}
+				LogInfo("waiting for your opponent's army (%llds elapsed)",
+					static_cast<long long>(elapsed));
 			}
-			return;
+			break;
 		}
 
 		case Phase::Injecting:
@@ -713,27 +1188,31 @@ namespace hmd::match
 
 			if (g_InjectedCount <= 0)
 			{
-				LogWarn("no opponent units were injected - resuming normal act "
-					"progression");
-				roster::SetDefaultWaveSuppressed(false);
+				AbandonDuel("your opponent's army could not be spawned");
 				SetPhase(Phase::Idle, "injection produced no units");
-				return;
+				break;
 			}
 
 			g_ResultSent = false;
+			g_SawInjectedEnemies = false;
+			g_InjectedAt = now;
+
+			ui::Notify("%s's army of %d is in the arena. Fight!",
+				PeerLabel().c_str(), g_InjectedCount);
+
 			SetPhase(Phase::Fighting, "opponent wave live");
-			return;
+			break;
 		}
 
 		case Phase::Fighting:
 		{
 			Outcome outcome = EvaluateBattle();
 			if (outcome == Outcome::Undecided)
-				return;
+				break;
 
 			ApplyOutcome(outcome == Outcome::LocalWon);
 			SetPhase(Phase::Resolving, "battle decided");
-			return;
+			break;
 		}
 
 		case Phase::Resolving:
@@ -741,35 +1220,48 @@ namespace hmd::match
 			// Wait for the peer's own result so both clients agree on the score
 			// before deciding whether the run continues.
 			if (!g_PeerResultReceived)
-				return;
+			{
+				banner = "WAITING FOR THEIR RESULT...";
+				break;
+			}
 
 			LogStage(kStageResolve, "lives - local %d, remote %d",
 				g_Lives.local, g_Lives.remote);
 
 			if (g_Lives.local <= 0 || g_Lives.remote <= 0)
 			{
-				LogStage(kStageResolve, "game over - %s",
-					g_Lives.local <= 0 ? "local player is out of lives"
-									   : "peer is out of lives");
+				ui::Notify("%s", g_Lives.local <= 0
+					? "You are out of lives. Match over."
+					: "Your opponent is out of lives. You win the match!");
+
 				roster::SetDefaultWaveSuppressed(false);
 				SetPhase(Phase::GameOver, "a player reached zero lives");
-				return;
+				break;
 			}
 
-			// Lives remain on both sides: advance to the next act.
+			// Lives remain on both sides: carry on with the run.
+			g_CompletedDuelRound = g_DuelRound;
+			g_DuelRound = 0;
 			g_PeerArmy = roster::Snapshot{};
 			g_LocalArmy = roster::Snapshot{};
 			g_PeerResultReceived = false;
 			g_ResultSent = false;
 			g_InjectedCount = 0;
+			g_SawInjectedEnemies = false;
 			roster::SetDefaultWaveSuppressed(false);
 
-			SetPhase(Phase::Idle, "advancing to the next act");
-			return;
+			ui::Notify("Lives: you %d, %s %d. Next duel at round %d.",
+				g_Lives.local, PeerLabel().c_str(), g_Lives.remote,
+				runstate::NextDuelRound(g_CompletedDuelRound + 1));
+
+			SetPhase(Phase::Idle, "duel resolved - run continues");
+			break;
 		}
 
 		default:
-			return;
+			break;
 		}
+
+		PushOverlay(banner);
 	}
 }

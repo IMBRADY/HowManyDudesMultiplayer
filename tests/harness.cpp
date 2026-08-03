@@ -16,6 +16,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
+#include "DuelSchedule.h"
 #include "Json.h"
 #include "Log.h"
 #include "Net.h"
@@ -497,11 +498,83 @@ namespace
 		std::this_thread::sleep_for(std::chrono::milliseconds(200));
 		hmd::net::Shutdown();
 	}
+
+	// --- Duel schedule ----------------------------------------------------
+	//
+	// This is the arithmetic that decides which round's boss fight becomes a
+	// duel. Its failure modes are not subtle - an off-by-one here means either
+	// no duels at all or a duel that never ends - but they are invisible
+	// without two machines, so they are pinned down here instead.
+	void TestDuelSchedule()
+	{
+		using namespace hmd::duel;
+
+		printf("\n[duel] which rounds are duel rounds\n");
+
+		Check(IsDuelRound(20, 20), "round 20 is a duel round");
+		Check(IsDuelRound(40, 20), "round 40 is a duel round");
+		Check(IsDuelRound(60, 20), "round 60 is a duel round");
+		Check(!IsDuelRound(19, 20), "round 19 is not");
+		Check(!IsDuelRound(21, 20), "round 21 is not");
+		Check(!IsDuelRound(1, 20), "the first round is not");
+
+		// The round tracker reports 0 when it could not resolve a round. If
+		// that counted as a duel round the gate would fire the instant a run
+		// started, empty the arena, and wait forever for an opponent who is
+		// not at a duel either.
+		Check(!IsDuelRound(0, 20), "an unknown round is never a duel round");
+		Check(!IsDuelRound(-5, 20), "a negative round is never a duel round");
+
+		printf("\n[duel] when the next duel is\n");
+
+		Check(NextDuelRound(0, 20) == 20, "before the run starts, it is round 20");
+		Check(NextDuelRound(1, 20) == 20, "from round 1, it is round 20");
+		Check(NextDuelRound(19, 20) == 20, "from round 19, it is round 20");
+		Check(NextDuelRound(20, 20) == 20, "round 20 is its own next duel");
+		Check(NextDuelRound(21, 20) == 40, "from round 21, it is round 40");
+		Check(NextDuelRound(40, 20) == 40, "round 40 is its own next duel");
+		Check(NextDuelRound(41, 20) == 60, "from round 41, it is round 60");
+
+		printf("\n[duel] a custom interval\n");
+
+		Check(IsDuelRound(5, 5), "an interval of 5 duels on round 5");
+		Check(!IsDuelRound(6, 5), "and not on round 6");
+		Check(NextDuelRound(6, 5) == 10, "the next one is round 10");
+		Check(IsDuelRound(7, 1), "an interval of 1 duels every round");
+
+		printf("\n[duel] rejected intervals\n");
+
+		Check(!IsValidInterval(0), "an interval of 0 is refused");
+		Check(!IsValidInterval(-1), "a negative interval is refused");
+		Check(!IsValidInterval(100000), "an absurd interval is refused");
+		Check(IsValidInterval(20), "the default interval is accepted");
+
+		// A bad interval must not make every round a duel round by way of a
+		// modulo against zero, which would also be a divide by zero.
+		Check(!IsDuelRound(20, 0), "a zero interval never reports a duel round");
+		Check(NextDuelRound(20, 0) == 0, "and never schedules one");
+
+		printf("\n[duel] progress when the round number is unknown\n");
+
+		// Both clients have to agree on how far along each other is, even when
+		// one of them could only resolve the act.
+		Check(ProgressFromAct(1, 20) == 20, "finishing act 1 is 20 rounds in");
+		Check(ProgressFromAct(3, 20) == 60, "finishing act 3 is 60 rounds in");
+		Check(ProgressFromAct(0, 20) == 0, "an unknown act reports no progress");
+		Check(ProgressFromAct(2, 0) == 0, "a bad interval reports no progress");
+
+		// The estimate has to line up with the real thing, or a player whose
+		// round resolved would never match one whose did not.
+		Check(IsDuelRound(ProgressFromAct(2, 20), 20),
+			"an act-derived progress lands on a real duel round");
+	}
 }
 
 int main()
 {
 	printf("HowManyDudesMultiplayer - offline test harness\n");
+
+	TestDuelSchedule();
 
 	TestJsonBasics();
 	TestJsonRobustness();

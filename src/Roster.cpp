@@ -166,7 +166,7 @@ namespace hmd::roster
 					bridge::CallBuiltin("clipboard_set_text", { RValue(previous) });
 			};
 
-			if (!bridge::CallScript(kExport, {}))
+			if (!bridge::CallScriptAnnounced(kExport, {}))
 			{
 				restore();
 				return {};
@@ -394,7 +394,7 @@ namespace hmd::roster
 			// dude_is_knocked_out is a confirmed top-level script; prefer it
 			// over guessing at a member name.
 			RValue knocked;
-			if (bridge::CallScript("gml_Script_dude_is_knocked_out", { dude }, knocked))
+			if (bridge::CallScriptAnnounced("gml_Script_dude_is_knocked_out", { dude }, knocked))
 				unit.knocked_out = knocked.ToBoolean();
 
 			Out.units.push_back(std::move(unit));
@@ -461,7 +461,7 @@ namespace hmd::roster
 			bridge::ScriptExists("gml_Script_custom_matchup_parse"))
 		{
 			RValue parsed;
-			if (bridge::CallScript(
+			if (bridge::CallScriptAnnounced(
 					"gml_Script_custom_matchup_parse",
 					{ RValue(Peer.matchup) },
 					parsed) &&

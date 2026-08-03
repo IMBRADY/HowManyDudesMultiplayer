@@ -44,6 +44,32 @@ namespace hmd::bridge
 		const std::vector<YYTK::RValue>& Arguments = {}
 	);
 
+	// Call a script this mod has not proven safe to invoke, announcing the
+	// first such call to the log immediately before making it.
+	//
+	// Why this exists: YYC strips the bytecode, so a routine's name is the only
+	// thing we have to go on, and a name does not say what a routine IS. A
+	// diagnostic in this mod once called gml_Script_wave_real to see what it
+	// returned; it turned out to be a constructor, and invoking it raised a GML
+	// error that took the game down on startup. A GML-level error cannot be
+	// caught from here - there is no try/except that reaches it - so the only
+	// defence available is to make the log say what we were about to do. If the
+	// game dies, the last line names the routine responsible.
+	//
+	// Use this for any script the mod calls that it has not observed the game
+	// calling itself. Prefer builtins, which have signatures that are part of
+	// GameMaker and cannot drift.
+	bool CallScriptAnnounced(
+		const std::string& ScriptName,
+		const std::vector<YYTK::RValue>& Arguments,
+		YYTK::RValue& Result
+	);
+
+	bool CallScriptAnnounced(
+		const std::string& ScriptName,
+		const std::vector<YYTK::RValue>& Arguments = {}
+	);
+
 	// Call a GameMaker builtin by name. Returns nullopt on failure.
 	std::optional<YYTK::RValue> CallBuiltin(
 		const std::string& FunctionName,
@@ -110,4 +136,17 @@ namespace hmd::bridge
 	// first o_dude the mod sees, because YYC strips the VARI chunk and the real
 	// member layout is only discoverable at runtime.
 	void LogInstanceMembers(const YYTK::RValue& Instance, const char* Label);
+
+	// Log only the members whose name contains one of the given substrings,
+	// with their values.
+	//
+	// The global scope has thousands of members and an alphabetical dump never
+	// gets past the letter B before any sane cap stops it - which is exactly
+	// how the first attempt to find the run's round counter failed. Searching
+	// beats dumping when you already know what you are looking for.
+	void LogMatchingMembers(
+		const YYTK::RValue& Instance,
+		const char* Label,
+		const std::vector<std::string>& Substrings
+	);
 }

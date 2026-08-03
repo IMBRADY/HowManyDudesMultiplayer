@@ -62,6 +62,13 @@ namespace hmd::steam
 	// The peer's Steam persona name once connected, else empty.
 	std::string PeerName();
 
+	// This player's own Steam persona name, or empty if Steam is unavailable.
+	//
+	// Sent to the peer in the status beacon rather than relying on them looking
+	// it up: over a direct TCP session there is no lobby to read a name out of,
+	// and the opponent badge should still say who you are.
+	std::string LocalName();
+
 	// --- Transport -------------------------------------------------------
 	// Mirrors hmd::net's surface so the two are interchangeable.
 

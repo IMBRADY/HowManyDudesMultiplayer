@@ -1,8 +1,11 @@
 # How Many Dudes? Multiplayer Mod
 
 Turns the single-player run into a **two-player duel**. You both play your own
-run as normal; at the end of each act you swap armies and fight each other's
-roster. Lose the fight, lose a life. First to zero is out.
+run as normal; every 20 rounds the boss fight is replaced by a fight against
+your friend's army. Lose the fight, lose a life. First to zero is out.
+
+Start a run and your friend gets pulled into one too. In the menu you can see
+who you're connected to, and during a run you can see which round they're on.
 
 **Both players need to do everything on this page.** It takes about five
 minutes. If you get stuck, jump to [Troubleshooting](#troubleshooting) - the
@@ -100,7 +103,7 @@ Then **launch the game**. If everything is working you'll see a console window
 alongside the game with a green line like:
 
 ```
-[HMD-MP] ready. F9 host | F10 join | F11 disconnect | F8 status
+[HMD-MP] ready. F9 host | F10 join | F11 disconnect | F8 status | F6 diagnostics
 ```
 
 That line means you're done. No console window at all means Aurie isn't
@@ -110,21 +113,55 @@ loading - see [Troubleshooting](#troubleshooting).
 
 ## Step 4 - Play together
 
-Join via steam in-game overlay (F7 or Shift+Tab) and join your friends. 
+One of you invites, the other accepts. **Press F7 twice:**
 
-### What happens from there
+- **First F7** - opens a Steam lobby. Wait for `steam: lobby open` in the console
+- **Second F7** - opens Steam's invite dialog. Pick your friend
 
-Play normally. When an act ends, the mod takes over for a moment:
+Your friend clicks the invite and you're connected. No ports, no IP addresses,
+works over the internet.
 
-1. **SERIALIZE** - each of you sends your army to the other.
-2. **INJECT** - the normal enemy wave is replaced with your opponent's army.
-3. **RESOLVE** - whoever's army falls loses a life. At zero lives, that run ends.
+> Shift+Tab on its own won't show an "Invite to Game" option for this mod - you
+> have to open the dialog with F7. Press **F8** any time to check the link.
 
-Then the next act starts and it happens again. If your friend is behind, the mod
-waits up to **5 minutes** for them to finish their act, telling you what they're
-up to while you wait, then just lets the act play out normally. If their
+On a local network you can skip Steam entirely: one player presses **F9**, the
+other presses **F10**.
+
+### What you'll see once you're connected
+
+- **In the menu** - your friend's Steam name and a dude head in the top-right
+  corner, so you can tell at a glance that the link is live.
+- **Starting a run** - whoever presses start pulls the other in. If one of you
+  is already in a run, they're left where they are.
+- **During a run** - a dude head sits above your friend's current round on the
+  round track at the top of the screen, so you can see how far ahead or behind
+  they are.
+- **Messages** - connecting, duels, lives lost and the final result all appear
+  on screen through the game's own message stream.
+
+### The duel
+
+Play normally. Every **20 rounds** - the round that would normally be a boss
+fight - the mod takes over instead:
+
+1. **WAIT** - if you got there first, the arena is held empty behind a
+   `WAITING FOR <friend>` banner until they reach the same round. No boss
+   spawns; you're not fighting anything while you wait.
+2. **SERIALIZE** - once you're both there, each of you sends your army to the
+   other.
+3. **INJECT** - your friend's army is spawned as your opponents.
+4. **RESOLVE** - whoever's army falls loses a life. At zero lives, that run ends.
+
+Then the run carries on to round 21 and it happens again at round 40.
+
+If your friend never turns up, the duel is called off after **5 minutes**, the
+round is rebuilt with its normal boss, and you play it as usual. If their
 connection actually drops, the match ends and your run carries on unmodded - a
 dropped connection can't ruin your run.
+
+You can change the 20 to anything you like with `duel_interval`, and turn off
+the synced start with `sync_run_start`. Both players should use the same
+`duel_interval`.
 
 ---
 
@@ -139,14 +176,20 @@ dropped connection can't ruin your run.
 | No console window when the game starts | Aurie isn't loading | Usually step 2c. Run `install.bat /detect` and check all three lines |
 | Console appears, but no `[HMD-MP]` lines | Aurie is loading, this mod isn't | Re-run `install.bat`; check the DLL is in `mods\Aurie\` |
 | Worked yesterday, broken today | Steam updated or verified the game | Re-run step 2c, then `install.bat` |
+| No "Invite to Game" when you press Shift+Tab | Expected - the mod doesn't advertise to the friends list | Press **F7 twice** instead. The second press opens Steam's invite dialog |
+| **F7** twice shows no dialog | Steam overlay isn't loading | Steam → Settings → In Game → enable the overlay, and check the same box in the game's Properties |
 | **F10** does nothing / "no host answered" | Discovery blocked, or host isn't hosting | Confirm the other player pressed **F9** first. Allow the game through Windows Firewall on both PCs. Both on the same network? |
 | Connects, then immediately drops | Mismatched builds, or mismatched passphrase | You must both run the **same version** of the DLL. Check `session_key` matches exactly |
 | "peer presented the wrong session key" | Passphrase mismatch | Make them identical on both machines, including spaces |
-| Acts end normally, nothing is exchanged | Not connected when the act ended | Press **F8** and check for `link=connected` |
+| Round 20 passes normally, no duel | Not connected, or the round number didn't resolve | Press **F8** for `link=connected`, then **F6** and look for `round=` and `tracking=` |
 | Game crashes on launch | Framework version mismatch | Make sure YYToolkit is **5.0.0c**. v5 breaks all v4 mods, including this one |
+| No name/head in the menu corner | The draw hook didn't install | Press **F6**; look for `draw hook installed` and `head sprite resolved` |
+| No head on the round track | Same, or your friend's round is unknown | Press **F6**; check `run-map cell(s) tracked` is not 0 |
+| Nothing appears on screen, but the log looks fine | The game's message stream didn't take | Press **F6** and check `info stream`. Everything still works, it's just quiet |
 
-**Still stuck?** Press **F8** in-game and read the console. Every line the mod
-prints starts with `[HMD-MP]`, and it says exactly which stage failed.
+**Still stuck?** Press **F8** in-game for a status line, or **F6** for a full
+diagnostic dump. Every line the mod prints starts with `[HMD-MP]`, and it says
+exactly which stage failed.
 
 ---
 
@@ -164,6 +207,9 @@ edits are never overwritten.
 | `enable_discovery` | `true` | Set `false` to disable network discovery and use addresses only |
 | `auto_host` | `false` | Host automatically at launch instead of pressing F9 |
 | `auto_join` | `false` | Join automatically at launch instead of pressing F10 |
+| `duel_interval` | `20` | Rounds between duels. Both players should match |
+| `sync_run_start` | `true` | One player pressing start also starts the other's run |
+| `on_screen_messages` | `true` | Show the mod's messages in-game. Turn off if they misbehave; the log still has them |
 
 ---
 

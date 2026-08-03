@@ -2,14 +2,20 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 //
-// Phase 3: end-of-act interception, payload exchange, and the shared 3-lives
-// system.
+// Phase 3: duel interception, payload exchange, and the shared 3-lives system.
 //
 // The state machine is driven from the frame callback rather than from inside
 // a hook. That ordering matters: a hook fires on the game's own thread in the
 // middle of the game's own call stack, which is the worst place to block on a
-// network round-trip. The hook's only job is to *notice* the act boundary and
-// raise a flag; all the work happens on the next frame tick.
+// network round-trip. The hook's only job is to *notice* something and raise a
+// flag; all the work happens on the next frame tick.
+//
+// Duels replace boss fights. Every DuelInterval rounds - 20 by default, which
+// is the length of an act and therefore the round that would otherwise be a
+// boss - the two players fight each other's armies instead of the game's boss.
+// Because the two runs are not step-locked, whoever arrives first waits: the
+// arena is held empty behind a banner until the opponent reaches the same
+// round, and only then are armies exchanged.
 //
 #include "Roster.h"
 
@@ -21,14 +27,15 @@ namespace hmd::match
 {
 	enum class Phase
 	{
-		Offline,       // No peer session.
-		Idle,          // Connected, nothing pending.
-		Capturing,     // Act ended; snapshotting the local army.
-		AwaitingPeer,  // Local payload sent; waiting for the peer's.
-		Injecting,     // Peer payload received; building the opponent wave.
-		Fighting,      // Opponent wave is live.
-		Resolving,     // Battle finished; settling lives.
-		GameOver       // A player has run out of lives.
+		Offline,           // No peer session.
+		Idle,              // Connected, nothing pending.
+		AwaitingPeerRound, // At a duel round; waiting for the opponent to reach it.
+		Capturing,         // Both at the duel round; snapshotting the local army.
+		AwaitingPeer,      // Local payload sent; waiting for the peer's.
+		Injecting,         // Peer payload received; building the opponent wave.
+		Fighting,          // Opponent wave is live.
+		Resolving,         // Battle finished; settling lives.
+		GameOver           // A player has run out of lives.
 	};
 
 	// Lives are tracked for both sides so either client can render the score
@@ -44,12 +51,22 @@ namespace hmd::match
 
 	// What the opponent last told us they were doing. The two runs are not
 	// step-locked, so this is what lets a client say "waiting for your opponent
-	// to start a run" rather than appearing to hang.
+	// to reach round 20" rather than appearing to hang, and it is what places
+	// their marker on the round track.
 	struct PeerPresence
 	{
 		bool known = false;   // False until the first status beacon arrives.
 		bool in_run = false;  // In rm_gameplay with a live army.
 		int act = 0;
+		int round = 0;        // 0 when their client could not resolve one.
+
+		// How far through their run they are, in rounds. Always populated -
+		// their real round when they know it, an act-derived estimate when they
+		// do not - so the two clients can always compare progress even if only
+		// one of them managed to resolve a round number.
+		int progress = 0;
+
+		std::string name;     // Their Steam persona name, if they have one.
 	};
 
 	bool Initialize(Aurie::AurieModule* Module);
@@ -58,9 +75,14 @@ namespace hmd::match
 	// Called once per rendered frame. Drives the whole exchange.
 	void Tick();
 
-	// Raised by the end-of-act hook (or by the poller, if the hook is not
-	// available) to signal that the act has finished.
+	// Raised by the end-of-round hook. No longer starts an exchange - duels are
+	// triggered by reaching a duel round, not by finishing an act - but it is
+	// still the most reliable signal that the run has moved on, so it is used
+	// to re-read the round and to clear the completed-duel guard.
 	void SignalActEnded();
+
+	// Whether one player pressing "start run" pulls the other into a run too.
+	void SetSyncRunStart(bool Enabled);
 
 	// True while the mod wants the game's default wave generation suppressed.
 	bool ShouldSuppressDefaultWave();
@@ -80,4 +102,7 @@ namespace hmd::match
 	// Reset the session state without dropping the network link. Used when a
 	// new run starts.
 	void ResetMatchState();
+
+	// Log what the duel machinery resolved to.
+	void Report();
 }
