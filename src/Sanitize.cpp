@@ -66,6 +66,58 @@ namespace hmd::sanitize
 		return out;
 	}
 
+	std::string ClampNotification(const std::string& Value)
+	{
+		// Anything the markup parser might treat as a delimiter. Replaced with a
+		// space rather than deleted so that stripping a bracket cannot silently
+		// weld two words together, and so a message made entirely of markup
+		// collapses to whitespace and is then rejected by the trim below.
+		auto is_markup = [](unsigned char c)
+		{
+			switch (c)
+			{
+			case '[': case ']':
+			case '{': case '}':
+			case '<': case '>':
+			case '|': case '\\':
+			case '^': case '~':
+			case '$': case '#':
+				return true;
+			default:
+				return false;
+			}
+		};
+
+		std::string out;
+		out.reserve(Value.size() < kMaxNotification ? Value.size() : kMaxNotification);
+
+		for (unsigned char c : Value)
+		{
+			if (out.size() >= kMaxNotification)
+				break;
+
+			// Non-ASCII is dropped rather than passed through: the message is
+			// assembled byte-wise from several sources, so a truncated multi-byte
+			// sequence is possible, and a lone continuation byte is exactly the
+			// kind of thing that produces an empty parsed name.
+			if (c < 0x20 || c >= 0x7F)
+				continue;
+
+			const char replacement = is_markup(c) ? ' ' : static_cast<char>(c);
+
+			// Collapse runs of whitespace, including runs created by stripping.
+			if (replacement == ' ' && (out.empty() || out.back() == ' '))
+				continue;
+
+			out.push_back(replacement);
+		}
+
+		while (!out.empty() && out.back() == ' ')
+			out.pop_back();
+
+		return out;
+	}
+
 	bool IsMatchupPayload(const std::string& Candidate)
 	{
 		if (Candidate.empty() || Candidate.size() > kMaxMatchupBytes)

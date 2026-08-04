@@ -81,14 +81,32 @@ namespace hmd::runstate
 	// The run is over or abandoned; stop reporting a round.
 	void NoteRunEnded();
 
-	// How far through the run the player is, in rounds, always answerable.
-	// The real round when it is known, and act * DuelInterval when it is not.
-	// This is what the two clients compare to decide whether they have both
-	// reached the same duel, because it is defined on both of them whatever
-	// each was able to resolve.
+	// Record that the player is currently standing in a room that only exists
+	// during a run. Called every tick from the match state machine.
+	void NoteInRunRoom();
+
+	// True once a run room has been seen since the last NoteRunStarted.
+	//
+	// This exists because new_run_start fires while the player is still in
+	// rm_mainmenu, so "round > 0 and we are in the menu" is true for a few
+	// frames at the START of every run as well as at the end of one. Without
+	// this the count was discarded immediately after being set. See the caller.
+	bool HasBeenInRunRoom();
+
+	// How far through the run the player is, in rounds. The real round when it
+	// is known, and 0 when it is not. This is what the two clients compare to
+	// decide whether they have both reached the same duel.
+	//
+	// There is no longer an estimate behind this. It used to fall back to
+	// act * DuelInterval, read out of the game with gml_Script_get_act_number,
+	// and that script can abort the game when a mod calls it. A client that
+	// cannot resolve its round now reports 0 and never opens a duel gate, which
+	// is a feature that quietly does not work rather than a crash.
 	int CurrentProgress();
 
-	// The act number, straight from the game's own accessor. 0 if unavailable.
+	// Which act the player has got through, derived from the round. Never read
+	// out of the game - see kUnsafeActScript in RunState.cpp. 0 when the round
+	// is unknown. Reported and logged only; nothing gates on it.
 	int CurrentAct();
 
 	// Rounds between duels. Defaults to 20 - the length of an act, which is the

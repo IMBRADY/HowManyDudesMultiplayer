@@ -259,6 +259,54 @@ namespace
 		Check(ClampText("a\nb").size() == 2, "control characters are dropped entirely");
 	}
 
+	// Everything ui::Notify says ends up inside the game's own markup parser,
+	// which aborts the game rather than complaining when it dislikes its input.
+	// One tester's game died on "variable_struct_set: illegal to use empty
+	// names" coming out of cf_parse, so what reaches it is pinned down here.
+	void TestSanitizeNotifications()
+	{
+		printf("\n[sanitize] notifications are safe to hand to cf_parse\n");
+
+		using hmd::sanitize::ClampNotification;
+
+		Check(ClampNotification("You beat Nur's army!") == "You beat Nur's army!",
+			"an ordinary message passes through unchanged");
+		Check(ClampNotification("Round 20 - duel round.") ==
+			"Round 20 - duel round.", "punctuation the mod actually uses survives");
+
+		// The injection vector: opponent names come from Steam and are whatever
+		// that player typed into it.
+		Check(ClampNotification("Connected to [rainbow]bob.").find('[') ==
+			std::string::npos, "markup brackets are stripped");
+		Check(ClampNotification("hi {x} there").find('{') == std::string::npos,
+			"so are braces");
+		Check(ClampNotification("a<b>c").find('<') == std::string::npos,
+			"so are angle brackets");
+
+		// Stripping must not weld words together, and must not leave the ragged
+		// whitespace that stripping produces.
+		Check(ClampNotification("one[]two") == "one two",
+			"stripped markup leaves a separator, not a join");
+		Check(ClampNotification("  lots   of   space  ") == "lots of space",
+			"whitespace is collapsed and trimmed");
+
+		// The case that actually killed a game: nothing renderable left. The
+		// caller must be able to tell, so it can skip the game call entirely.
+		Check(ClampNotification("").empty(), "empty input stays empty");
+		Check(ClampNotification("[[[]]]").empty(),
+			"a message made only of markup collapses to empty");
+		Check(ClampNotification("\n\t\r").empty(),
+			"a message made only of control characters collapses to empty");
+
+		Check(ClampNotification(std::string(1000, 'x')).size() ==
+			hmd::sanitize::kMaxNotification, "an over-long message is truncated");
+
+		// A truncated multi-byte sequence is possible because messages are
+		// assembled byte-wise from several sources.
+		Check(ClampNotification("caf\xC3").find('\xC3') == std::string::npos,
+			"a dangling multi-byte lead is dropped");
+	}
+
 	void TestSanitizeMatchupDetection()
 	{
 		printf("\n[sanitize] only real matchup payloads are trusted\n");
@@ -567,6 +615,28 @@ namespace
 		// round resolved would never match one whose did not.
 		Check(IsDuelRound(ProgressFromAct(2, 20), 20),
 			"an act-derived progress lands on a real duel round");
+
+		printf("\n[duel] the act, derived rather than asked for\n");
+
+		// The act used to come from gml_Script_get_act_number, which can abort
+		// the game when a mod calls it. It is derived now, and the only thing
+		// that makes that substitution honest is that it agrees with the value
+		// it replaced at the boundaries anyone looks at.
+		Check(ActFromRound(20, 20) == 1, "round 20 is the end of act 1");
+		Check(ActFromRound(40, 20) == 2, "round 40 is the end of act 2");
+		Check(ActFromRound(1, 20) == 0, "round 1 is still act 0");
+		Check(ActFromRound(19, 20) == 0, "and so is round 19");
+		Check(ActFromRound(21, 20) == 1, "round 21 is one act in");
+
+		Check(ActFromRound(0, 20) == 0, "an unknown round reports no act");
+		Check(ActFromRound(-5, 20) == 0, "and so does a negative one");
+		Check(ActFromRound(20, 0) == 0, "a bad interval reports no act");
+
+		// The round trip is the whole justification for using floor.
+		Check(ProgressFromAct(ActFromRound(20, 20), 20) == 20,
+			"act and progress round-trip on a duel round");
+		Check(ProgressFromAct(ActFromRound(60, 20), 20) == 60,
+			"and on a later one");
 	}
 }
 
@@ -580,6 +650,7 @@ int main()
 	TestJsonRobustness();
 	TestSanitizeNumbers();
 	TestSanitizeText();
+	TestSanitizeNotifications();
 	TestSanitizeMatchupDetection();
 	TestNetLoopback();
 	TestNetRejectsGarbage();

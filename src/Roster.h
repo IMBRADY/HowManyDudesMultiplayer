@@ -72,4 +72,15 @@ namespace hmd::roster
 	// True while the mod wants the game's own wave composition suppressed.
 	bool IsDefaultWaveSuppressed();
 	void SetDefaultWaveSuppressed(bool Suppressed);
+
+	// How many enemy instances ClearDefaultEnemyWave has destroyed since the
+	// counter was last reset.
+	//
+	// This is the difference between "the duel was called off and the round is
+	// exactly as the game left it" and "the duel was called off after the mod
+	// deleted the wave the player was supposed to fight". Those need different
+	// things said to the player, and the mod cannot tell them apart after the
+	// fact any other way.
+	int EnemiesCleared();
+	void ResetEnemiesCleared();
 }

@@ -32,7 +32,16 @@ namespace hmd::runstate
 		// fallback that did exactly that. Named here so nobody reinstates it
 		// without reading why it went.
 		// constexpr const char* kBoxScript = "gml_Script_cf_get_box";
-		constexpr const char* kActScript = "gml_Script_get_act_number";
+
+		// Deliberately not called either, for the same class of reason. This one
+		// resolves and looks harmless - it is a getter, by every reading of its
+		// name - but it calls gold_star_round internally, and that aborts the
+		// game with "I32 argument is undefined" when it is entered from a mod
+		// tick rather than from the game's own progression. A tester's game died
+		// on it twice inside twenty seconds. The act is now derived from the
+		// round instead; see duel::ActFromRound. The name is kept only so the
+		// probe can report whether the build still has it.
+		constexpr const char* kUnsafeActScript = "gml_Script_get_act_number";
 
 		// A round number read from a UI hook is only believed for as long as
 		// that UI is plausibly still on screen. Past that we fall back down the
@@ -90,6 +99,10 @@ namespace hmd::runstate
 		// The counted round. Maintained from the run-start and round-finish
 		// hooks, which is the only source on this build that actually works.
 		std::atomic<int> g_CountedRound{ 0 };
+
+		// Whether a room that only exists during a run has been seen since the
+		// current run started. See HasBeenInRunRoom.
+		std::atomic<bool> g_SeenRunRoom{ false };
 
 		// --- Hook state ---------------------------------------------------
 		PFUNC_YYGMLScript g_RoundNumberTrampoline = nullptr;
@@ -174,25 +187,13 @@ namespace hmd::runstate
 			return Value.Width() > 1.0 && Value.Height() > 1.0;
 		}
 
-		int ReadIntScript(const char* ScriptName)
-		{
-			if (!bridge::ScriptExists(ScriptName))
-				return 0;
-
-			RValue result;
-			if (!bridge::CallScript(ScriptName, {}, result))
-				return 0;
-
-			if (result.m_Kind != VALUE_REAL && result.m_Kind != VALUE_INT32 &&
-				result.m_Kind != VALUE_INT64)
-				return 0;
-
-			const double raw = result.ToDouble();
-			if (!std::isfinite(raw))
-				return 0;
-
-			return static_cast<int>(raw);
-		}
+		// There was a ReadIntScript helper here - call a no-argument game script,
+		// believe it if it hands back a finite number. Its only caller was the
+		// act lookup, and that lookup is what crashed a tester's game. A generic
+		// "call any script and read the result" helper is how an unsafe call gets
+		// added without anyone weighing whether that particular script is safe to
+		// call, so it went with its caller rather than being left to invite the
+		// next one.
 
 		// Globals the round might live in. YYC strips VARI, so this is a probe
 		// list in the same spirit as Roster.cpp's field candidates.
@@ -334,21 +335,75 @@ namespace hmd::runstate
 			// cell on the map every frame, and measuring one means calling back
 			// into the game - so measuring all of them to place a single sprite
 			// would cost hundreds of script calls a second for nothing.
+			// Which link in this chain fails is the open question behind the
+			// opponent marker never appearing. Every early return below is a
+			// different answer, and from outside they all look identical - the
+			// cell simply is not there. So each one is named, once every ten
+			// seconds and immediately whenever the answer changes.
+			//
+			// This runs for every cell on the map every frame. Everything here
+			// is cheap and nothing is logged on the happy path.
+			auto note = [](const char* What)
+			{
+				static const char* last = nullptr;
+				static clock::time_point at{};
+
+				const auto now = clock::now();
+				if (What == last && (now - at) < std::chrono::seconds(10))
+					return;
+
+				last = What;
+				at = now;
+				LogInfo("run map: %s", What);
+			};
+
 			const int tracked = g_TrackedRound.load(std::memory_order_relaxed);
 			if (tracked <= 0)
+			{
+				note("no opponent round is being tracked, so no cell is measured");
 				return returned;
+			}
 
 			int round = 0;
 			if (!hooks::FindIntegerArgument(ArgumentCount, Arguments,
 					kMinRound, kMaxRound, round))
+			{
+				note("could not find a round number in run_map_cell's arguments");
 				return returned;
+			}
 
 			if (round != tracked)
+			{
+				// Expected for most cells - only one matches. Logged anyway
+				// because "the map never draws the opponent's cell at all" and
+				// "it draws it and we reject it" are different problems, and
+				// the numbers tell them apart.
+				static int last_seen = 0;
+				if (round != last_seen)
+				{
+					last_seen = round;
+					LogInfo("run map: drew cell for round %d, waiting for %d",
+						round, tracked);
+				}
 				return returned;
+			}
 
 			Box box;
-			if (!ReadCakeframeBox(returned, box) || !BoxIsPlausible(box))
+			if (!ReadCakeframeBox(returned, box))
+			{
+				note("the opponent's cell was drawn but its box could not be read");
 				return returned;
+			}
+
+			if (!BoxIsPlausible(box))
+			{
+				LogInfo("run map: the opponent's cell box was rejected as "
+					"implausible: %.0f,%.0f..%.0f,%.0f",
+					box.left, box.top, box.right, box.bottom);
+				return returned;
+			}
+
+			note("measuring the opponent's cell");
 
 			std::lock_guard<std::mutex> lock(g_Mutex);
 			g_Cells[round] = Cell{ box, clock::now() };
@@ -424,38 +479,113 @@ namespace hmd::runstate
 
 	bool ReadCakeframeBox(const RValue& Frame, Box& Out)
 	{
-		// VALUE_OBJECT only, deliberately.
+		// Accepts the kinds a cakeframe actually arrives as, which includes
+		// VALUE_REF.
 		//
-		// This used to accept VALUE_REF as well, and the draw hooks used to
-		// hand it whatever their first argument happened to be. A sprite
-		// reference is a VALUE_REF, and feeding one to cf_get_box raised a GML
-		// error that aborted the game the moment a peer connected. Callers now
-		// only ever pass a cakeframe they got from run_map_cell's return value,
-		// and the kind check is the second line of defence.
-		if (Frame.m_Kind != VALUE_OBJECT || !Frame.m_Pointer)
+		// The history matters, because this check was VALUE_OBJECT-only on
+		// purpose. The draw hooks used to hand this whatever their first
+		// argument happened to be; a sprite reference is a VALUE_REF, and
+		// feeding one to cf_get_box aborted the game the moment a peer
+		// connected. Narrowing the kind was the fix.
+		//
+		// It was the wrong fix for the right problem. What made that crash
+		// possible was the CALLER passing an arbitrary argument, and that caller
+		// is gone - cf_get_box is no longer used at all, and the only route in
+		// here now is RunMapCellDetour passing run_map_cell's own return value.
+		// The kind check was doing a caller's job, and it was also rejecting the
+		// real thing: this runner returns cakeframes as VALUE_REF, exactly as it
+		// returns instances from instance_find. Logged as:
+		//
+		//     run map: the opponent's cell was drawn but its box could not be read
+		//
+		// which is the whole reason the opponent marker has never appeared.
+		const bool usable_kind =
+			Frame.m_Kind == VALUE_OBJECT ||
+			Frame.m_Kind == VALUE_REF ||
+			Frame.m_Kind == VALUE_PTR;
+
+		if (!usable_kind || !Frame.m_Pointer)
+		{
+			// Named once, so a kind nobody predicted does not become another
+			// silent rejection.
+			static int last_rejected = -1;
+			if (static_cast<int>(Frame.m_Kind) != last_rejected)
+			{
+				last_rejected = static_cast<int>(Frame.m_Kind);
+				LogInfo("run map: cakeframe arrived as kind %d, which is not "
+					"something a box can be read from", last_rejected);
+			}
 			return false;
+		}
 
 		// visual_box only. cf_get_box was the fallback and it is the one that
 		// crashed; a second accessor that can abort the game is not worth the
 		// marginal chance of a box the first one could not produce.
+		//
+		// The kind check above now passes and the read still fails, so the
+		// failure is somewhere in here - and this had exactly one outcome for
+		// four different causes. Each step is named once, the same way the
+		// detour above is, because "could not be read" has already cost two
+		// sessions of guessing.
+		auto note = [](const char* What)
+		{
+			static const char* last = nullptr;
+			if (What == last)
+				return;
+
+			last = What;
+			LogInfo("run map: %s", What);
+		};
+
 		for (const char* script : { kVisualBoxScript })
 		{
 			if (!bridge::ScriptExists(script))
+			{
+				note("cakeframe_get_visual_box does not exist on this build");
 				continue;
+			}
 
 			RValue result;
 			if (!bridge::CallScriptAnnounced(script, { Frame }, result))
+			{
+				note("cakeframe_get_visual_box could not be called");
 				continue;
+			}
 
 			if (result.m_Kind == VALUE_ARRAY)
 			{
 				if (ReadBoxFromArray(result, Out))
 					return true;
+
+				note("visual_box returned an array no box could be read from");
 			}
 			else if (result.m_Kind == VALUE_OBJECT || result.m_Kind == VALUE_REF)
 			{
 				if (ReadBoxFromStruct(result, Out))
 					return true;
+
+				note("visual_box returned a struct with no box fields in it - "
+					"press F6 in the ranch to dump what it does have");
+
+				// The names are the whole problem, so dump them once. This is
+				// the same trick that is about to name o_dude's members, and it
+				// is the only way to learn field names on a YYC build.
+				static bool dumped = false;
+				if (!dumped)
+				{
+					dumped = true;
+					bridge::LogInstanceMembers(result, "visual_box result");
+				}
+			}
+			else
+			{
+				static int last_kind = -1;
+				if (static_cast<int>(result.m_Kind) != last_kind)
+				{
+					last_kind = static_cast<int>(result.m_Kind);
+					LogInfo("run map: visual_box returned kind %d, which is "
+						"neither an array nor a struct", last_kind);
+				}
 			}
 		}
 
@@ -489,8 +619,23 @@ namespace hmd::runstate
 		return g_RoundEverResolved.load();
 	}
 
+	void NoteInRunRoom()
+	{
+		g_SeenRunRoom.store(true);
+	}
+
+	bool HasBeenInRunRoom()
+	{
+		return g_SeenRunRoom.load();
+	}
+
 	void NoteRunStarted()
 	{
+		// Cleared here, not in NoteRunEnded: the point of the flag is to say
+		// whether a run room has been seen since THIS run started, and at this
+		// moment the player is still in the menu the run was started from.
+		g_SeenRunRoom.store(false);
+
 		g_CountedRound.store(1);
 		g_RoundEverResolved.store(true);
 
@@ -534,16 +679,22 @@ namespace hmd::runstate
 
 	int CurrentProgress()
 	{
+		// Nothing but the round, now. There used to be an act-derived fallback
+		// for builds where the round never resolved, and it was worth having
+		// right up until the script it rested on turned out to be able to abort
+		// the game - at which point a fallback that crashes is worse than no
+		// fallback at all. On this build the round resolves from the round-
+		// finish hook anyway, which is the rung that has always done the work.
+		//
+		// Zero means "no idea", and every caller already treats it that way.
 		const int round = CurrentRound();
-		if (round > 0)
-			return round;
-
-		return duel::ProgressFromAct(CurrentAct(), DuelInterval());
+		return round > 0 ? round : 0;
 	}
 
 	int CurrentAct()
 	{
-		return ReadIntScript(kActScript);
+		// Derived, never asked. See kUnsafeActScript.
+		return duel::ActFromRound(CurrentRound(), DuelInterval());
 	}
 
 	int DuelInterval()
@@ -633,7 +784,7 @@ namespace hmd::runstate
 		LogInfo("probe: round=%d (source: %s) tracking=%s progress=%d act=%d "
 			"duel every %d rounds",
 			round, g_RoundSource,
-			RoundTrackingAvailable() ? "available" : "UNAVAILABLE (act fallback)",
+			RoundTrackingAvailable() ? "available" : "UNAVAILABLE (no duel gate)",
 			CurrentProgress(), CurrentAct(), DuelInterval());
 
 		// Report only whether the candidate accessors exist. Emphatically do
@@ -651,7 +802,7 @@ namespace hmd::runstate
 				"gml_Script_get_round_to_jump_to",
 				"gml_Script_round_has_boss",
 				"gml_Script_jump_to_round",
-				kActScript })
+				kUnsafeActScript })
 		{
 			LogInfo("probe:   %s - %s", script,
 				bridge::ScriptExists(script) ? "present" : "not present");

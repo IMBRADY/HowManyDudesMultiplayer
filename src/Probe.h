@@ -26,6 +26,25 @@ namespace hmd::probe
 	// True while the census is still accepting new names.
 	bool CensusOpen();
 
+	// Record how deep inside the engine's GML execution a code entry arrived,
+	// and whether the mod judged it a safe point to call back into the game.
+	//
+	// Depth is the number of code entries already open when this one arrived,
+	// so a top-level entry is depth 0.
+	//
+	// This measures the assumption the whole safe-window gate rests on - that
+	// top-level code entries actually reach the hook on this runner. Nobody can
+	// read this build's bytecode to confirm that, so it is counted instead, and
+	// the report says outright when the count is zero. Unlike the census this
+	// never closes: a gate that works at the main menu and not inside a run
+	// would otherwise look fine.
+	void NoteSafeWindow(int Depth, bool Safe);
+
+	// Record that a leaked depth counter had to be forced back to zero. Expected
+	// to be zero; a number that climbs means the runtime is leaving the mod's
+	// frame without returning through it.
+	void NoteDepthReset();
+
 	// Dump everything discovered so far: the code-entry census, the global
 	// variable listing, and the resolution state of the things the features
 	// depend on. Bound to a hotkey and also fired once automatically a few

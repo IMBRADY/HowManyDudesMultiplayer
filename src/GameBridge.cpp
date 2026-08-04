@@ -25,6 +25,133 @@ namespace hmd::bridge
 		// Scripts whose first unproven call has already been announced.
 		std::set<std::string> g_AnnouncedScripts;
 
+		const char* KindName(int Kind)
+		{
+			switch (Kind)
+			{
+			case VALUE_REAL:      return "real";
+			case VALUE_STRING:    return "string";
+			case VALUE_ARRAY:     return "array";
+			case VALUE_PTR:       return "ptr";
+			case VALUE_UNDEFINED: return "undefined";
+			case VALUE_OBJECT:    return "object";
+			case VALUE_INT32:     return "int32";
+			case VALUE_INT64:     return "int64";
+			case VALUE_NULL:      return "null";
+			case VALUE_BOOL:      return "bool";
+			case VALUE_REF:       return "ref";
+			default:              return "?";
+			}
+		}
+
+		// Turn whatever instance_find handed back into a CInstance*.
+		//
+		// instance_find on this runner returns kind 15, VALUE_REF - confirmed
+		// from a log, not assumed.
+		//
+		// The previous attempt read the RValue union's m_Instance directly for a
+		// ref and then "validated" the result by asking YYToolkit to enumerate
+		// its members. That killed the game outright, twice, with no GameMaker
+		// error and no stack trace - just a dead process, because for a ref
+		// those bytes are an id and flags rather than a pointer, and enumerating
+		// members dereferences whatever it is given.
+		//
+		// The lesson, written down because it was expensive: **a pointer cannot
+		// be validated by dereferencing it.** The check was the crash.
+		//
+		// So nothing here reads the union as a pointer. Every pointer returned
+		// comes from a runtime call that is designed to produce one:
+		//
+		//   ToInstance()      -> RV_ToPointer, the runtime's own resolution,
+		//                        which understands what a ref is.
+		//   GetInstanceObject -> looks the id up in the room's instance list and
+		//                        fails cleanly when it is not there.
+		//
+		// ToInt32 is RV_ToInt32, the conversion that aborts the game with "I32
+		// argument is undefined". It must never see an undefined, which is why
+		// the default case converts nothing at all.
+		CInstance* ResolveInstanceValue(const RValue& Value, const char*& HowOut)
+		{
+			switch (Value.m_Kind)
+			{
+			case VALUE_OBJECT:
+			case VALUE_PTR:
+			case VALUE_REF:
+			{
+				// Let the runtime resolve it. A ref is exactly what RV_ToPointer
+				// exists to unwrap.
+				if (CInstance* instance = Value.ToInstance())
+				{
+					HowOut = "runtime pointer";
+					return instance;
+				}
+
+				// A ref that would not unwrap may still name an id.
+				CInstance* by_id = nullptr;
+				const int32_t id = Value.ToInt32();
+				if (id >= 0 &&
+					AurieSuccess(g_Api->GetInstanceObject(id, by_id)) && by_id)
+				{
+					HowOut = "ref id lookup";
+					return by_id;
+				}
+
+				return nullptr;
+			}
+
+			case VALUE_REAL:
+			case VALUE_INT32:
+			case VALUE_INT64:
+			{
+				// instance_find returns noone (-4) for a stale index.
+				const int32_t id = Value.ToInt32();
+				if (id < 0)
+					return nullptr;
+
+				CInstance* instance = nullptr;
+				if (AurieSuccess(g_Api->GetInstanceObject(id, instance)) && instance)
+				{
+					HowOut = "id lookup";
+					return instance;
+				}
+
+				return nullptr;
+			}
+
+			default:
+				// Undefined, unset, null and everything else. Not converted,
+				// not dereferenced, not passed on.
+				return nullptr;
+			}
+		}
+
+		// Structured exception handling, deliberately, and not as a substitute
+		// for the reasoning above.
+		//
+		// Everything this mod does runs inside the game's process, and a bad
+		// pointer here does not raise a catchable error - it takes the whole
+		// game down with no log line and no stack trace, which is precisely how
+		// the last two test sessions ended. The functions above are now careful
+		// enough that this should never fire; it exists so that being wrong
+		// about the runtime's internals one more time costs a warning and a
+		// disabled feature rather than someone's run.
+		//
+		// No C++ objects with destructors in this frame - MSVC will not compile
+		// __try in a function that requires unwinding, and the guarded region is
+		// kept to the single call for the same reason.
+		CInstance* ResolveInstanceGuarded(const RValue& Value, const char*& HowOut)
+		{
+			__try
+			{
+				return ResolveInstanceValue(Value, HowOut);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+				HowOut = "faulted";
+				return nullptr;
+			}
+		}
+
 		bool ResolveScriptIndex(const std::string& ScriptName, int& Index)
 		{
 			if (!g_Api)
@@ -345,16 +472,53 @@ namespace hmd::bridge
 		return index;
 	}
 
+	// Live instances of an object, as values the rest of the mod can actually
+	// read members from and hand to game scripts.
+	//
+	// This used to be instance_number + instance_find in a loop, keeping
+	// whatever RValue came back. Those RValues were not usable. The evidence,
+	// from a duel at round 2:
+	//
+	//     --- members of o_dude ---
+	//     --- 0 member(s) listed, 0 runtime-internal name(s) hidden ---
+	//     field 'type' did not resolve to any known member name
+	//     ... (all ten fields)
+	//     I32 argument is undefined
+	//     - gml_Script_dude_is_knocked_out:238
+	//
+	// Nothing could be enumerated off them, every field read failed, and handing
+	// one to a game script aborted the game outright. The old loop only ever
+	// rejected a negative VALUE_REAL, so an undefined sailed straight through
+	// into the array and out the other side into GML.
+	//
+	// InvokeWithObject is YYToolkit's own instance enumeration and it hands back
+	// CInstance pointers rather than ids. RValue has a constructor for those
+	// which produces a VALUE_OBJECT, which is what GetInstanceMember and
+	// EnumInstanceMembers want and what the old path never produced.
 	std::vector<RValue> FindInstances(const std::string& ObjectName)
 	{
 		std::vector<RValue> instances;
+
+		if (!g_Api)
+			return instances;
 
 		int object_index = AssetIndex(ObjectName);
 		if (object_index < 0)
 			return instances;
 
-		// GML numbers are reals; pass doubles so the runtime never has to
-		// coerce an int64 argument.
+		// instance_number / instance_find, then GetInstanceObject on each id.
+		//
+		// InvokeWithObject was tried here and finds nothing when handed an
+		// object index as a VALUE_REAL - FindInstances("o_gameplay") came back
+		// empty from inside rm_gameplay, which made ArenaIsPopulated permanently
+		// false and stopped every duel from triggering. The builtin pair does
+		// find the instances; what it hands back is just ids.
+		//
+		// So the ids are what gets asked for, and GetInstanceObject turns each
+		// one into the CInstance the rest of the mod actually needs. That is the
+		// step that was missing all along: the old code pushed the raw id and
+		// then tried to read members off a number, which is why every field
+		// lookup reported "did not resolve" and why nothing could be enumerated.
 		auto count_value = CallBuiltin(
 			"instance_number",
 			{ RValue(static_cast<double>(object_index)) }
@@ -366,9 +530,8 @@ namespace hmd::bridge
 		if (count <= 0)
 			return instances;
 
-		// Sanity bound: a plausible arena never holds this many combatants, and
-		// a bogus count here would otherwise mean a very long loop on the frame
-		// thread.
+		// A plausible arena never holds this many combatants, and a bogus count
+		// would otherwise mean a very long loop on the frame path.
 		constexpr int kMaxInstances = 4096;
 		if (count > kMaxInstances)
 		{
@@ -379,24 +542,78 @@ namespace hmd::bridge
 
 		instances.reserve(static_cast<size_t>(count));
 
+		int unresolved = 0;
+		int faulted = 0;
+		int observed_kind = -1;
+
 		for (int i = 0; i < count; i++)
 		{
-			auto instance = CallBuiltin(
+			auto found = CallBuiltin(
 				"instance_find",
 				{ RValue(static_cast<double>(object_index)), RValue(static_cast<double>(i)) }
 			);
 
+			if (!found)
+				continue;
+
+			observed_kind = static_cast<int>(found->m_Kind);
+
+			const char* how = "?";
+			CInstance* instance = ResolveInstanceGuarded(*found, how);
 			if (!instance)
-				continue;
+			{
+				if (how && strcmp(how, "faulted") == 0)
+					faulted++;
 
-			// instance_find returns noone (-4) when the index is stale.
-			if (instance->m_Kind == VALUE_REAL && instance->ToInt32() < 0)
+				unresolved++;
 				continue;
+			}
 
-			instances.push_back(*instance);
+			// Which reading of the union turned out to be the right one. Worth
+			// exactly one line per object for the whole session, and it is the
+			// line that closes this question for good.
+			static std::set<std::string> reported;
+			if (reported.insert(ObjectName).second)
+			{
+				LogInfo("instances of %s resolve via '%s' (instance_find kind "
+					"%d)", ObjectName.c_str(), how, observed_kind);
+			}
+
+			instances.emplace_back(instance);
+		}
+
+		if (unresolved > 0)
+		{
+			static std::set<std::string> complained;
+			if (complained.insert(ObjectName).second)
+			{
+				// The kind is the whole point of this line. Two rewrites of this
+				// function have now been built on a guess about what
+				// instance_find hands back; naming it means the next one is not.
+				LogWarn("%d of %d %s instance(s) could not be resolved to an "
+					"object - instance_find returned kind %d (%s). They are "
+					"skipped rather than passed on.",
+					unresolved, count, ObjectName.c_str(),
+					observed_kind, KindName(observed_kind));
+
+				if (faulted > 0)
+				{
+					LogError("%d of those FAULTED - resolving them raised an "
+						"access violation that would have killed the game. The "
+						"guard held. Do not remove it.", faulted);
+				}
+			}
 		}
 
 		return instances;
+	}
+
+	bool IsUsableInstance(const RValue& Value)
+	{
+		// VALUE_OBJECT with a live pointer is what FindInstances now produces.
+		// Anything else - and undefined above all - must never reach a game
+		// script: dude_is_knocked_out aborts the game on one.
+		return Value.m_Kind == VALUE_OBJECT && Value.m_Pointer != nullptr;
 	}
 
 	std::string CurrentRoomName()

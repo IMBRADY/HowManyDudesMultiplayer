@@ -34,8 +34,10 @@ namespace hmd::steam
 		constexpr int kGameLobbyJoinRequested = 300 + 33;
 
 		// k_iSteamNetworkingMessagesCallbacks = 1250.
-		// SteamNetworkingMessagesSessionRequest_t is the first of them.
+		// SteamNetworkingMessagesSessionRequest_t is the first of them,
+		// SteamNetworkingMessagesSessionFailed_t the second.
 		constexpr int kMessagesSessionRequest = 1250 + 1;
+		constexpr int kMessagesSessionFailed = 1250 + 2;
 
 		// ELobbyType::k_ELobbyTypeFriendsOnly
 		constexpr int kLobbyTypeFriendsOnly = 1;
@@ -50,7 +52,24 @@ namespace hmd::steam
 		// sides and must not collide with anything the game itself uses.
 		constexpr int kChannel = 0x484D;
 
-		#pragma pack(push, 1)
+		// Steam's callback structs are declared under #pragma pack(push, 8) in
+		// the SDK headers (VALVE_CALLBACK_PACK_LARGE on x64), NOT pack(1).
+		//
+		// This was pack(1), and it mattered: LobbyCreated_t is
+		// { EResult (4 bytes); uint64 lobby id; }, so under the real ABI the
+		// lobby id sits at offset 8 and the struct is 16 bytes. Packed to 1 it
+		// was 12 bytes with the id at offset 4 - so PollPendingLobbyCreate read
+		// the lobby id out of four bytes of padding and four bytes of the real
+		// id, and assigned that to g_Lobby. From that moment the host was
+		// holding a lobby handle that does not exist: GetNumLobbyMembers on it
+		// returns 0, so the host never adopted the peer, never reached
+		// LobbyState::Joined, and therefore never sent a single byte.
+		//
+		// It failed silently and asymmetrically, because draining incoming
+		// messages does not depend on our own state - so the host still received
+		// the guest's beacons and could name them, while the guest heard nothing
+		// and reported "opponent ?" forever.
+		#pragma pack(push, 8)
 		struct SteamNetworkingIdentity
 		{
 			int32_t m_eType;
@@ -94,7 +113,21 @@ namespace hmd::steam
 
 		static_assert(sizeof(SteamNetworkingIdentity) == 136,
 			"SteamNetworkingIdentity layout does not match the Steamworks ABI");
-		static_assert(sizeof(LobbyCreated_t) == 12, "LobbyCreated_t layout changed");
+		static_assert(offsetof(SteamNetworkingIdentity, m_steamID64) == 8,
+			"SteamNetworkingIdentity::m_steamID64 moved");
+
+		// The one that was wrong. Assert the offset, not just the size: a size
+		// that happens to match with the field in the wrong place is exactly the
+		// failure this is here to catch.
+		static_assert(offsetof(LobbyCreated_t, m_ulSteamIDLobby) == 8,
+			"LobbyCreated_t::m_ulSteamIDLobby moved - the lobby id would be read "
+			"out of padding and the host would hold a lobby that does not exist");
+		static_assert(sizeof(LobbyCreated_t) == 16, "LobbyCreated_t layout changed");
+
+		static_assert(offsetof(LobbyEnter_t, m_ulSteamIDLobby) == 0,
+			"LobbyEnter_t::m_ulSteamIDLobby moved");
+		static_assert(sizeof(LobbyEnter_t) == 24, "LobbyEnter_t layout changed");
+
 		static_assert(sizeof(GameLobbyJoinRequested_t) == 16,
 			"GameLobbyJoinRequested_t layout changed");
 		static_assert(sizeof(MessagesSessionRequest_t) == 136,
@@ -174,6 +207,7 @@ namespace hmd::steam
 			// User / friends
 			CSteamID(*GetSteamID)(void*) = nullptr;
 			const char* (*GetPersonaName)(void*) = nullptr;
+			const char* (*GetFriendPersonaName)(void*, CSteamID) = nullptr;
 			bool (*ActivateInviteOverlay)(void*, CSteamID) = nullptr;
 
 			// Matchmaking
@@ -271,11 +305,25 @@ namespace hmd::steam
 
 				g_Peer = member;
 
+				// g_PeerName was declared, cleared in four places, and never
+				// once assigned - so steam::PeerName() always returned an empty
+				// string and every "who am I playing?" fallback in the mod fell
+				// through to "your opponent". The lobby knows who they are
+				// before a single message has crossed, so read it here.
+				if (g_Api.GetFriendPersonaName)
+				{
+					const char* name = g_Api.GetFriendPersonaName(g_Friends, g_Peer);
+					if (name && *name)
+						g_PeerName = name;
+				}
+
 				SteamNetworkingIdentity identity = MakeIdentity(g_Peer);
 				if (g_Api.AcceptSessionWithUser)
 					g_Api.AcceptSessionWithUser(g_Messages, &identity);
 
 				SetState(LobbyState::Joined, "peer present in lobby");
+				LogStage(kStageConnect, "steam: opponent is '%s'",
+					g_PeerName.empty() ? "?" : g_PeerName.c_str());
 				return;
 			}
 		}
@@ -330,16 +378,41 @@ namespace hmd::steam
 			// EResult::k_EResultOK == 1
 			if (!ok || io_failure || result.m_eResult != 1)
 			{
+				// If LobbyEnter already handed us a working lobby, believe it
+				// over this. Reporting a failure and tearing the state down
+				// would throw away a session that is demonstrably up.
+				if (g_Lobby && g_State == LobbyState::Hosting)
+				{
+					LogWarn("steam: could not read the lobby-creation result, but "
+						"the lobby is already open - continuing");
+					return;
+				}
+
 				LogError("steam: lobby creation failed (result %d)", result.m_eResult);
 				SetState(LobbyState::None, "lobby creation failed");
 				return;
 			}
 
 			// The LobbyEnter callback normally gets here first and has already
-			// stamped the protocol tag and moved us to Hosting. This path
-			// exists to catch the failure case above, so only finish the job if
-			// the callback has not already done it.
-			g_Lobby = result.m_ulSteamIDLobby;
+			// stamped the protocol tag and moved us to Hosting.
+			//
+			// Never overwrite a lobby id that callback established. It is the
+			// authoritative one - it is the id Steam handed us on entering the
+			// lobby we are actually sitting in - and this used to clobber it
+			// with a value read at the wrong offset, after which the host owned
+			// a handle to nothing. A disagreement between the two is worth
+			// saying out loud rather than silently picking one.
+			if (g_Lobby && g_Lobby != result.m_ulSteamIDLobby)
+			{
+				LogWarn("steam: lobby id from the creation result (%llu) does not "
+					"match the one we entered (%llu) - keeping the latter",
+					static_cast<unsigned long long>(result.m_ulSteamIDLobby),
+					static_cast<unsigned long long>(g_Lobby));
+			}
+			else if (!g_Lobby)
+			{
+				g_Lobby = result.m_ulSteamIDLobby;
+			}
 
 			if (g_State != LobbyState::Hosting)
 			{
@@ -526,9 +599,33 @@ namespace hmd::steam
 			int GetCallbackSizeBytes() override { return sizeof(MessagesSessionRequest_t); }
 		};
 
+		// The other half of the session story. A relay session that cannot be
+		// established fails here, and without this the only symptom is silence -
+		// which is indistinguishable from an opponent who simply has not sent
+		// anything yet, and which cost a whole playtest to tell apart.
+		//
+		// The payload is SteamNetConnectionInfo_t, which is large and has grown
+		// between SDK versions, so it is deliberately never dereferenced: the
+		// fact that a session failed is the useful part.
+		class SessionFailedCallback : public CallbackBase
+		{
+		public:
+			void Run(void*) override
+			{
+				LogError("steam: the peer-to-peer session with your opponent "
+					"failed - press F11 and reconnect");
+			}
+
+			void Run(void* Parameter, bool, SteamAPICall_t) override { Run(Parameter); }
+
+			// Never used to size a read, only compared by Steam's dispatcher.
+			int GetCallbackSizeBytes() override { return 0; }
+		};
+
 		JoinRequestedCallback g_JoinRequested;
 		LobbyEnterCallback g_LobbyEnter;
 		SessionRequestCallback g_SessionRequest;
+		SessionFailedCallback g_SessionFailed;
 		bool g_CallbacksRegistered = false;
 	}
 
@@ -556,6 +653,12 @@ namespace hmd::steam
 			g_Api.SteamNetworkingMessages);
 		ok &= Bind(steam, "SteamAPI_ISteamUser_GetSteamID", g_Api.GetSteamID);
 		ok &= Bind(steam, "SteamAPI_ISteamFriends_GetPersonaName", g_Api.GetPersonaName);
+
+		// Not gated on `ok`: knowing the opponent's name is a nicety, and losing
+		// the whole Steam path over it would be a bad trade.
+		Bind(steam, "SteamAPI_ISteamFriends_GetFriendPersonaName",
+			g_Api.GetFriendPersonaName);
+
 		ok &= Bind(steam, "SteamAPI_ISteamFriends_ActivateGameOverlayInviteDialog",
 			g_Api.ActivateInviteOverlay);
 		ok &= Bind(steam, "SteamAPI_ISteamMatchmaking_CreateLobby", g_Api.CreateLobby);
@@ -606,9 +709,11 @@ namespace hmd::steam
 		g_JoinRequested.m_iCallback = kGameLobbyJoinRequested;
 		g_LobbyEnter.m_iCallback = kLobbyEnter;
 		g_SessionRequest.m_iCallback = kMessagesSessionRequest;
+		g_SessionFailed.m_iCallback = kMessagesSessionFailed;
 		g_Api.RegisterCallback(&g_JoinRequested, kGameLobbyJoinRequested);
 		g_Api.RegisterCallback(&g_LobbyEnter, kLobbyEnter);
 		g_Api.RegisterCallback(&g_SessionRequest, kMessagesSessionRequest);
+		g_Api.RegisterCallback(&g_SessionFailed, kMessagesSessionFailed);
 		g_CallbacksRegistered = true;
 
 		g_Available = true;
@@ -631,6 +736,7 @@ namespace hmd::steam
 			g_Api.UnregisterCallback(&g_JoinRequested);
 			g_Api.UnregisterCallback(&g_LobbyEnter);
 			g_Api.UnregisterCallback(&g_SessionRequest);
+			g_Api.UnregisterCallback(&g_SessionFailed);
 			g_CallbacksRegistered = false;
 		}
 
@@ -666,6 +772,20 @@ namespace hmd::steam
 				last_reported = members;
 				LogInfo("steam: lobby now has %d member(s)%s", members,
 					members < 2 ? " - waiting for your friend to join" : "");
+
+				// You are always a member of a lobby you are in, so zero is not
+				// "nobody joined yet" - it means this handle does not name a
+				// real lobby. That is exactly what a mis-read LobbyCreated_t
+				// produced, and it is worth naming outright, because every
+				// downstream symptom of it (no peer, nothing ever sent,
+				// "opponent ?" on the other machine) looks like something else.
+				if (members == 0 && g_State != LobbyState::Joining)
+				{
+					LogError("steam: lobby %llu reports no members at all - that "
+						"handle is not a real lobby. Press F11, then F7 to open "
+						"a new one.",
+						static_cast<unsigned long long>(g_Lobby));
+				}
 			}
 		}
 

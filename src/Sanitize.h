@@ -62,6 +62,25 @@ namespace hmd::sanitize
 	// name cannot corrupt console output or carry embedded newlines.
 	std::string ClampText(const std::string& Value);
 
+	// The longest on-screen notification the mod will ask the game to render.
+	// Generous next to anything the mod actually says; the point is that a
+	// peer-supplied name embedded in a message cannot make it unbounded.
+	inline constexpr size_t kMaxNotification = 240;
+
+	// Make a string safe to hand to the game's own text renderer.
+	//
+	// ui::Notify passes its message to gml_Script_hmd_infostream_spawn, which
+	// runs it through cf_parse - Cakeframe's markup parser. That parser builds
+	// struct members out of what it finds between its delimiters, and it aborts
+	// the game outright ("variable_struct_set: illegal to use empty names") when
+	// it ends up with an empty name. Every notification carries interpolated
+	// text - opponent names come from Steam and are whatever that player typed -
+	// so the markup characters are stripped rather than trusted.
+	//
+	// Returns an empty string when nothing renderable is left, which callers
+	// must treat as "do not call the game at all" rather than as empty text.
+	std::string ClampNotification(const std::string& Value);
+
 	// True when Candidate is a plausible custom-matchup export: non-empty, no
 	// larger than kMaxMatchupBytes, parses as a JSON object, and carries at
 	// least kMinMatchupKeys of the exporter's own top-level keys.

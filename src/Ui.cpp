@@ -5,10 +5,12 @@
 #include "GameHooks.h"
 #include "Log.h"
 #include "RunState.h"
+#include "Sanitize.h"
 
 #include <atomic>
 #include <cstdarg>
 #include <mutex>
+#include <string>
 
 using namespace YYTK;
 using namespace Aurie;
@@ -284,27 +286,93 @@ namespace hmd::ui
 			);
 		}
 
+		// Why the opponent marker did or did not get drawn.
+		//
+		// The marker has never been seen on screen, and there are at least three
+		// independent reasons it might not be - no cell measured, the peer not
+		// tracked, or the cell being in a different coordinate space from the one
+		// drawn in. Guessing between them from the outside is what this exists to
+		// stop. Rate limited, and it reports immediately whenever the reason
+		// changes so a transition is never hidden behind the interval.
+		void NoteMarkerState(const char* Reason, const runstate::Box* Cell,
+			const runstate::Box* Space, double DrawY)
+		{
+			using clock = std::chrono::steady_clock;
+			constexpr auto kInterval = std::chrono::seconds(10);
+
+			static const char* last_reason = nullptr;
+			static clock::time_point last_logged{};
+
+			const auto now = clock::now();
+			const bool changed = (Reason != last_reason);
+
+			if (!changed && (now - last_logged) < kInterval)
+				return;
+
+			last_reason = Reason;
+			last_logged = now;
+
+			if (!Cell || !Space)
+			{
+				LogInfo("marker: not drawn - %s", Reason);
+				return;
+			}
+
+			// Both boxes on one line on purpose. If the cell numbers are not on
+			// the same scale as the draw space, the marker is being drawn in a
+			// coordinate system it does not belong to, and that is visible here
+			// and nowhere else.
+			LogInfo("marker: %s | cell %.0f,%.0f..%.0f,%.0f -> head at %.0f,%.0f "
+				"| draw space %.0f,%.0f..%.0f,%.0f",
+				Reason,
+				Cell->left, Cell->top, Cell->right, Cell->bottom,
+				Cell->CenterX(), DrawY,
+				Space->left, Space->top, Space->right, Space->bottom);
+
+			const bool outside =
+				Cell->CenterX() < Space->left || Cell->CenterX() > Space->right ||
+				DrawY < Space->top || DrawY > Space->bottom;
+
+			if (outside)
+			{
+				LogWarn("marker: that lands OUTSIDE the drawable area - the cell "
+					"box and the draw call are in different coordinate spaces, "
+					"which no amount of nudging the offset will fix");
+			}
+		}
+
 		// Feature 4: where your opponent is on the round track.
 		void DrawPeerRoundMarker(const Overlay& Snapshot, const runstate::Box& Space)
 		{
 			if (Snapshot.peer_round <= 0 || !Snapshot.peer_in_run)
+			{
+				NoteMarkerState("opponent is not in a run we can place",
+					nullptr, nullptr, 0.0);
 				return;
+			}
 
 			runstate::Box cell;
 			if (!runstate::CellBox(Snapshot.peer_round, cell))
+			{
+				NoteMarkerState("no run-map cell has been measured for their round",
+					nullptr, nullptr, 0.0);
 				return;
+			}
 
 			const double head_size = cell.Height() * 0.9;
 
-			// Sat above the cell, clear of it, so it reads as "they are here"
-			// rather than obscuring which round the cell is.
-			DrawHead(
-				cell.CenterX(),
-				cell.top - head_size * 0.6,
-				head_size
-			);
+			// Below the cell rather than above it.
+			//
+			// Above was the original choice and it reads better - it points down
+			// at the cell it means. It is also the edge the run map runs closest
+			// to, so a marker on the top row had nowhere to go. Below is the
+			// safer side, and the marker has never been seen on screen, so the
+			// safer side is worth more than the nicer reading right now.
+			const double head_y = cell.bottom + head_size * 0.6;
 
-			UNREFERENCED_PARAMETER(Space);
+			NoteMarkerState("drawing", &cell, &Space, head_y);
+
+			DrawHead(cell.CenterX(), head_y, head_size);
 		}
 
 		// Feature 3's visible half: why the arena is empty while you wait.
@@ -542,12 +610,23 @@ namespace hmd::ui
 		if (!bridge::ScriptExists(kInfostreamScript))
 			return;
 
+		// The game's markup parser gets a scrubbed copy, never the raw message.
+		// The log above already has the original, so nothing is lost by being
+		// strict here - and cf_parse aborts the game rather than complaining
+		// when it dislikes its input.
+		const std::string safe = sanitize::ClampNotification(message);
+		if (safe.empty())
+		{
+			// Nothing renderable survived. Calling the game with an empty string
+			// is the exact input that kills cf_parse, so this returns instead.
+			return;
+		}
+
 		g_NotificationsTried.store(true);
 
 		// Announced, because this is a game routine the mod calls rather than
 		// one it has watched the game call - see CallScriptAnnounced.
-		if (bridge::CallScriptAnnounced(
-				kInfostreamScript, { RValue(std::string(message)) }))
+		if (bridge::CallScriptAnnounced(kInfostreamScript, { RValue(safe) }))
 			g_NotificationsWork.store(true);
 	}
 
@@ -570,6 +649,16 @@ namespace hmd::ui
 			HeadSpriteIndex() >= 0 ? "resolved" : "MISSING",
 			!bridge::ScriptExists(kInfostreamScript) ? "MISSING"
 				: g_NotificationsWork.load() ? "working" : "untested");
+
+		// The space every overlay draw call lands in. Printed next to the
+		// run-map cell boxes that runstate::Report lists immediately after, so
+		// the two can be read against each other: the opponent marker is placed
+		// from a cell box and drawn into this, and nothing in the code checks
+		// that they are the same coordinate system.
+		LogInfo("probe: gui draw space is %.0f x %.0f - run-map cell boxes below "
+			"must be on this scale for the opponent marker to land on screen",
+			ReadDouble("display_get_gui_width", 0.0),
+			ReadDouble("display_get_gui_height", 0.0));
 
 		// Which anchors exist, and - the part that matters - which are actually
 		// being called. An anchor that hooks cleanly and never fires draws

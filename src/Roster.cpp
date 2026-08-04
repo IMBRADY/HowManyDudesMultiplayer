@@ -15,6 +15,11 @@ namespace hmd::roster
 	{
 		std::atomic<bool> g_SuppressDefaultWave{ false };
 
+		// Enemies destroyed by ClearDefaultEnemyWave since the last reset. Read
+		// when a duel is called off, to decide whether the round the player is
+		// standing in still has anything in it. See EnemiesCleared.
+		std::atomic<int> g_EnemiesCleared{ 0 };
+
 		// YYC strips the VARI chunk, so the real instance member names are not
 		// knowable from data.win. Each logical field is probed against a list of
 		// plausible names and the first hit wins. The winning name is cached per
@@ -375,8 +380,21 @@ namespace hmd::roster
 		Out.units.clear();
 		Out.units.reserve(dudes.size());
 
+		int skipped_unusable = 0;
+
 		for (const RValue& dude : dudes)
 		{
+			// Never hand the runtime something it cannot use. dude_is_knocked_out
+			// aborts the entire game on a bad argument rather than returning an
+			// error - "I32 argument is undefined" at dude_is_knocked_out:238 is
+			// what ended a test session - so the check sits before the loop body
+			// rather than only in front of the call.
+			if (!bridge::IsUsableInstance(dude))
+			{
+				skipped_unusable++;
+				continue;
+			}
+
 			Unit unit;
 			unit.type = ReadString(dude, "type");
 			unit.name = ReadString(dude, "name");
@@ -391,13 +409,42 @@ namespace hmd::roster
 			unit.crit_chance = ReadNumber(dude, "crit_chance");
 			unit.crit_damage = ReadNumber(dude, "crit_damage");
 
-			// dude_is_knocked_out is a confirmed top-level script; prefer it
-			// over guessing at a member name.
-			RValue knocked;
-			if (bridge::CallScriptAnnounced("gml_Script_dude_is_knocked_out", { dude }, knocked))
-				unit.knocked_out = knocked.ToBoolean();
+			// Not asked for. dude_is_knocked_out is a confirmed script and it
+			// aborts the game outright on an argument it does not like:
+			//
+			//     I32 argument is undefined
+			//     - gml_Script_dude_is_knocked_out:238
+			//
+			// It was handed an instance and died, which means it wants something
+			// other than an instance - a dude id or a struct out of the roster,
+			// most likely. Guessing again costs another test session, and the
+			// cost of not knowing is small: an unconscious dude joins the army
+			// it is sent with. Wrong, but harmless and invisible next to a crash.
+			//
+			// The member dump above now runs against a real CInstance, so the
+			// next duel log names the actual members of o_dude. Read
+			// knocked-out state off one of those and delete this note.
+			unit.knocked_out = false;
 
 			Out.units.push_back(std::move(unit));
+		}
+
+		if (skipped_unusable > 0)
+		{
+			LogWarn("%d of %zu o_dude instance(s) were not readable and were "
+				"skipped - the army sent will be short by that many",
+				skipped_unusable, dudes.size());
+		}
+
+		// Every instance being unreadable is a different failure from there
+		// being no army, and it must not be reported as a successful capture of
+		// nothing: that would send an empty army and hand the opponent a free
+		// win. Fail, and let the caller call the duel off.
+		if (Out.units.empty())
+		{
+			LogWarn("none of the %zu o_dude instance(s) could be read - not "
+				"sending an empty army", dudes.size());
+			return false;
 		}
 
 		Out.matchup = CaptureGameNativeExport();
@@ -442,7 +489,19 @@ namespace hmd::roster
 				destroyed++;
 		}
 
+		g_EnemiesCleared.fetch_add(destroyed);
+
 		LogStage(kStageInject, "cleared %d default enemy instance(s)", destroyed);
+	}
+
+	int EnemiesCleared()
+	{
+		return g_EnemiesCleared.load();
+	}
+
+	void ResetEnemiesCleared()
+	{
+		g_EnemiesCleared.store(0);
 	}
 
 	int InjectOpponentArmy(const Snapshot& Peer)

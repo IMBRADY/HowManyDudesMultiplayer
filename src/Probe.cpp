@@ -32,6 +32,13 @@ namespace hmd::probe
 		std::atomic<bool> g_CensusOpen{ true };
 		std::atomic<bool> g_Reported{ false };
 
+		// Safe-window statistics. Separate from the census because these never
+		// stop counting - see NoteSafeWindow.
+		std::atomic<uint64_t> g_WindowEntries{ 0 };
+		std::atomic<uint64_t> g_WindowSafe{ 0 };
+		std::atomic<int> g_DeepestNesting{ 0 };
+		std::atomic<uint64_t> g_DepthResets{ 0 };
+
 		std::mutex g_Mutex;
 		std::set<const void*> g_CodeEntries;
 		uint64_t g_CodeCallbacks = 0;
@@ -62,6 +69,42 @@ namespace hmd::probe
 			{
 				LogWarn("probe: the code callback never fired - the mod's tick "
 					"is not running and nothing else here will work");
+			}
+		}
+
+		// The health of the safe-window gate, which is the thing standing
+		// between the mod and the crash that motivated it.
+		void ReportSafeWindow()
+		{
+			const uint64_t total = g_WindowEntries.load(std::memory_order_relaxed);
+			const uint64_t safe = g_WindowSafe.load(std::memory_order_relaxed);
+			const uint64_t resets = g_DepthResets.load(std::memory_order_relaxed);
+
+			// "Depth" throughout is the number of code entries already open when
+			// this one arrived, so depth 0 is a top-level entry and is the only
+			// one the mod will talk to the game from.
+			LogInfo("probe: safe window - %llu of %llu code entries at depth 0 "
+				"(%.1f%%), deepest %d enclosing entries, depth resets %llu",
+				static_cast<unsigned long long>(safe),
+				static_cast<unsigned long long>(total),
+				total ? (100.0 * static_cast<double>(safe) /
+					static_cast<double>(total)) : 0.0,
+				g_DeepestNesting.load(std::memory_order_relaxed),
+				static_cast<unsigned long long>(resets));
+
+			if (total > 0 && safe == 0)
+			{
+				LogWarn("probe: NO safe window has ever opened on this build - "
+					"the mod cannot call into the game at all, so duels and the "
+					"overlay are dead. Steam and the hotkeys still work.");
+			}
+
+			if (resets > 0)
+			{
+				LogWarn("probe: the nesting counter has been force-reset %llu "
+					"time(s) - the runtime is leaving the mod's frame without "
+					"returning through it, which is what a GML abort does",
+					static_cast<unsigned long long>(resets));
 			}
 		}
 
@@ -139,12 +182,36 @@ namespace hmd::probe
 		return g_CensusOpen.load(std::memory_order_relaxed);
 	}
 
+	void NoteSafeWindow(int Depth, bool Safe)
+	{
+		// Called on every single code entry - thousands a second by the census's
+		// own numbers - so this is relaxed atomics and nothing else. No lock, no
+		// allocation, and emphatically no call into the game.
+		g_WindowEntries.fetch_add(1, std::memory_order_relaxed);
+
+		if (Safe)
+			g_WindowSafe.fetch_add(1, std::memory_order_relaxed);
+
+		int deepest = g_DeepestNesting.load(std::memory_order_relaxed);
+		while (Depth > deepest &&
+			!g_DeepestNesting.compare_exchange_weak(deepest, Depth,
+				std::memory_order_relaxed))
+		{
+		}
+	}
+
+	void NoteDepthReset()
+	{
+		g_DepthResets.fetch_add(1, std::memory_order_relaxed);
+	}
+
 	void Report()
 	{
 		LogInfo("probe: ===== runtime discovery report =====");
 		LogInfo("probe: room=%s", bridge::CurrentRoomName().c_str());
 
 		ReportCodeCensus();
+		ReportSafeWindow();
 		ui::Report();
 		runstate::Report();
 		match::Report();

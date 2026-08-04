@@ -334,9 +334,22 @@ namespace
 			!presence.known ? "no word from them" :
 			presence.in_run ? "in a run" : "not in a run";
 
-		hmd::LogInfo("status: link=%s steam=%s peer=%s phase=%s lives local=%d "
-			"remote=%d room=%s",
+		// Their beacon first, then whoever Steam says is in the lobby with us.
+		// The second is what stops this reading "opponent ?" when the link is
+		// up but their messages are not arriving - the name is knowable from
+		// the lobby alone, and printing "?" made a transport problem look like
+		// an identity problem.
+		std::string opponent_name = presence.name;
+		if (opponent_name.empty())
+			opponent_name = hmd::steam::PeerName();
+
+		hmd::LogInfo("status: link=%s sending=%s steam=%s peer=%s phase=%s "
+			"lives local=%d remote=%d room=%s",
 			hmd::net::StateName(),
+			// Spelled out because the two are independent: incoming messages are
+			// drained whatever our own state is, so "I can see my opponent" is
+			// not evidence that they can see me.
+			hmd::net::IsConnected() ? "yes" : "NO",
 			hmd::steam::Available() ? hmd::steam::StateName() : "unavailable",
 			peer.empty() ? "none" : peer.c_str(),
 			hmd::match::PhaseName(),
@@ -348,7 +361,7 @@ namespace
 			"(act %d, round %d)",
 			local_in_run ? "in a run" : "not in a run",
 			hmd::runstate::CurrentRound(),
-			presence.name.empty() ? "?" : presence.name.c_str(),
+			opponent_name.empty() ? "?" : opponent_name.c_str(),
 			opponent,
 			presence.act,
 			presence.round);
@@ -364,7 +377,18 @@ namespace
 			hmd::LogInfo("last network error: %s", error.c_str());
 	}
 
-	void HandleHotkeys()
+	// Hotkeys are split across two functions, and the split is not cosmetic.
+	//
+	// WasKeyPressed reads GetAsyncKeyState's "pressed since last call" bit, so
+	// a key polled from two places has its edge consumed by whichever poll runs
+	// first and swallowed for the other. Each key is therefore polled in exactly
+	// one of these, and which one it lives in decides whether it still works
+	// when the safe window for calling into the game closes.
+	//
+	// Connection keys go here because none of them touch the game: Steam.cpp and
+	// Net.cpp between them make zero bridge:: calls. That matters most for F11 -
+	// if the game-facing pump ever stalls, disconnecting has to still work.
+	void HandleConnectionHotkeys()
 	{
 		// F7 is the whole Steam flow in one key: open a lobby if there isn't
 		// one, then show Steam's own invite dialog. The friend clicks the
@@ -404,7 +428,13 @@ namespace
 			hmd::steam::LeaveSession();
 			hmd::net::Disconnect();
 		}
+	}
 
+	// The reporting keys. Both read the game - PrintStatus through
+	// bridge::CurrentRoomName and the round tracker, probe::Report through a
+	// pile of builtins - so they are only polled from inside the safe window.
+	void HandleReportingHotkeys()
+	{
 		if (WasKeyPressed(kKeyStatus))
 			PrintStatus();
 
@@ -423,7 +453,56 @@ namespace
 	//
 	// That event fires many times per frame, so the work is throttled: the
 	// state machines want to run at roughly frame rate, not once per GML call.
-	void PumpOnce()
+	//
+	// ---------------------------------------------------------------------
+	// Why this is split in two
+	// ---------------------------------------------------------------------
+	//
+	// EVENT_OBJECT_CALL fires before EVERY code entry, including ones nested
+	// deep inside engine primitives. The whole pump used to run from all of
+	// them, which meant the mod could call back into the runtime at any point
+	// inside any engine operation. That killed a tester's game:
+	//
+	//     argument is not a method, unable to call
+	//     - gml_Object_o_combatant_Destroy_0:2
+	//     - gml_Object_o_enemy_Destroy_0:2
+	//     - gml_Script_instance_create:13
+	//     - gml_Script_enemy_spawn:97
+	//     - gml_Object_o_gameplay_Create_0:263
+	//
+	// The engine was inside instance_create_depth, running a fresh instance's
+	// event, when the hook fired the pump and the mod called straight back in.
+	// The half-built o_enemy was destroyed before its methods existed.
+	//
+	// So the work is now sorted by whether it touches the game:
+	//
+	//   PumpConnection - Steam and the transport. Steam.cpp and Net.cpp make
+	//                    zero bridge:: calls between them, so none of this can
+	//                    re-enter the runtime and it runs from every code entry
+	//                    exactly as before.
+	//
+	//   PumpGame       - the state machines, the overlay and the probe. All of
+	//                    them call into the game, so this runs only when the
+	//                    engine is between top-level code entries.
+	//
+	// The cost of being wrong in the safe direction is a feature going quiet.
+	// The cost of being wrong in the other direction is the stack above.
+	void PumpConnection()
+	{
+		using clock = std::chrono::steady_clock;
+		constexpr auto kInterval = std::chrono::milliseconds(16);
+
+		static clock::time_point last{};
+		const auto now = clock::now();
+		if (now - last < kInterval)
+			return;
+		last = now;
+
+		HandleConnectionHotkeys();
+		hmd::steam::Tick();
+	}
+
+	void PumpGame()
 	{
 		using clock = std::chrono::steady_clock;
 		constexpr auto kInterval = std::chrono::milliseconds(16);
@@ -441,8 +520,7 @@ namespace
 			hmd::LogInfo("tick is live - hotkeys active");
 		}
 
-		HandleHotkeys();
-		hmd::steam::Tick();
+		HandleReportingHotkeys();
 
 		// Order matters here. runstate ages out the run-map cells the overlay
 		// draws against, ui refreshes the per-frame draw budget, and match is
@@ -454,10 +532,48 @@ namespace
 		hmd::probe::Tick();
 	}
 
-	// Observe-only. Not calling Call() leaves YYToolkit to invoke the original,
-	// so the game's own code runs exactly as it would without the mod.
+	// ---------------------------------------------------------------------
+	// The safe window
+	// ---------------------------------------------------------------------
+	//
+	// How deep inside the engine's GML execution this thread currently is. Zero
+	// means the engine is between top-level code entries, which is the only
+	// point at which it is safe for the mod to call back into it.
+	//
+	// Maintaining this requires calling the original ourselves rather than
+	// leaving YYToolkit to do it, which is the one behavioural change here: the
+	// game's code still runs exactly as it would, but it now runs inside our
+	// frame instead of after it.
+	thread_local int g_CodeDepth = 0;
+
+	// Set while PumpGame is running, because the calls it makes into the game
+	// come straight back through this callback. Without it the pump would
+	// re-enter itself at what still looks like depth zero.
+	thread_local bool g_InPumpGame = false;
+
+	// The gate is only as good as its assumption that depth-zero entries
+	// actually arrive, and that assumption is about a runner nobody can read the
+	// bytecode of - so it is measured rather than trusted. probe::NoteSafeWindow
+	// keeps the counts and F6 reports them.
+
+	// A depth counter that only ever counts up is a mod that goes permanently
+	// silent. That is not hypothetical: the decrement below is skipped if the
+	// runtime leaves our frame without returning through it, which is exactly
+	// what GameMaker's own fatal error handling does. No legitimate nest of GML
+	// calls stays open for a second, so one that has is assumed leaked and the
+	// counter is put back to zero.
+	constexpr auto kDepthLeakTimeout = std::chrono::seconds(1);
+
+	// How long the game-facing pump may go unrun before saying so. Being quiet
+	// is a survivable outcome and a crash is not, so this reports rather than
+	// forcing the pump - but it must report, because a mod that silently does
+	// nothing is indistinguishable from one that is broken.
+	constexpr auto kPumpStarvedAfter = std::chrono::seconds(5);
+
 	void CodeCallback(FWCodeEvent& CodeContext)
 	{
+		using clock = std::chrono::steady_clock;
+
 		// The census is how the mod learns whether this runner exposes named
 		// code entries at all, which decides whether object Draw events are a
 		// viable hook target on this build. It closes itself after a few
@@ -467,15 +583,79 @@ namespace
 		if (hmd::probe::CensusOpen())
 			hmd::probe::NoteCodeEntry(std::get<2>(CodeContext.Arguments()));
 
-		PumpOnce();
+		const auto now = clock::now();
+
+		// Recover a leaked counter before reading it, so the recovery cannot
+		// itself be starved by the condition it exists to clear.
+		static thread_local clock::time_point depth_opened_at{};
+		if (g_CodeDepth > 0 && (now - depth_opened_at) > kDepthLeakTimeout)
+		{
+			g_CodeDepth = 0;
+			g_InPumpGame = false;
+			hmd::probe::NoteDepthReset();
+		}
+
+		// Never gated. Nothing in here can re-enter the runtime.
+		PumpConnection();
+
+		// Both of these are only ever touched from this callback, which is only
+		// ever entered on the game thread.
+		static clock::time_point last_safe_pump = now;
+		static clock::time_point last_starve_warning = now;
+
+		const bool safe = (g_CodeDepth == 0) && !g_InPumpGame;
+
+		hmd::probe::NoteSafeWindow(g_CodeDepth, safe);
+
+		if (safe)
+		{
+			last_safe_pump = now;
+
+			g_InPumpGame = true;
+			PumpGame();
+			g_InPumpGame = false;
+		}
+		else if ((now - last_safe_pump) > kPumpStarvedAfter &&
+			(now - last_starve_warning) > kPumpStarvedAfter)
+		{
+			last_starve_warning = now;
+			hmd::LogWarn("no safe window to talk to the game has opened in %llds "
+				"- duel logic and the overlay are idle. F7/F9/F10/F11 still "
+				"work. Press F6 for the entry counts.",
+				static_cast<long long>(
+					std::chrono::duration_cast<std::chrono::seconds>(
+						now - last_safe_pump).count()));
+		}
+
+		// Track the nest around the original. The guard is deliberately plain
+		// rather than RAII: a C++ destructor would not run on the paths that
+		// actually skip this decrement (the runtime's fatal handler does not
+		// unwind), so the leak timeout above is the real safety net and a
+		// scope guard here would only make it look otherwise.
+		if (g_CodeDepth == 0)
+			depth_opened_at = now;
+
+		g_CodeDepth++;
+
+		CodeContext.Call();
+
+		g_CodeDepth--;
 	}
 
-	// Kept registered in case a future YYToolkit does hook Present. Both paths
-	// share the throttle above, so being called from both costs nothing.
+	// Kept registered in case a future YYToolkit does hook Present. It is not
+	// delivered on this build - see the comment on PumpConnection.
+	//
+	// Connection work only, deliberately. EVENT_FRAME is an
+	// IDXGISwapChain::Present hook, and nothing here has established which
+	// thread that runs on for this runner. Calling into the game from the wrong
+	// one would be a fresh crash of exactly the kind this change exists to
+	// remove, and the game-facing pump loses nothing by being driven solely
+	// from the depth gate in CodeCallback.
 	void FrameCallback(FWFrame& FrameContext)
 	{
 		UNREFERENCED_PARAMETER(FrameContext);
-		PumpOnce();
+
+		PumpConnection();
 	}
 
 	// Diagnostic log written beside the DLL.
@@ -580,7 +760,9 @@ EXPORTED AurieStatus ModuleInitialize(
 		return AURIE_MODULE_INITIALIZATION_FAILED;
 	}
 
-	// The code-execution callback is the one that must succeed - see PumpOnce.
+	// The code-execution callback is the one that must succeed. It is the only
+	// thing that drives either pump on this build, and it is also where the
+	// safe window is measured - see CodeCallback.
 	AurieStatus status = hmd::g_Interface->CreateCallback(
 		Module,
 		EVENT_OBJECT_CALL,

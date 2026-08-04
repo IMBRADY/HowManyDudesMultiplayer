@@ -124,10 +124,19 @@ namespace hmd::bridge
 	int AssetIndex(const std::string& AssetName);
 
 	// All live instances of an object, by object name. Empty on any failure.
-	// Uses the runtime's own instance_number/instance_find builtins rather than
-	// walking engine-internal linked lists, which keeps this stable across
-	// runtime revisions.
+	//
+	// Every returned value is a VALUE_OBJECT wrapping a live CInstance, so it
+	// can be read with GetMember. The ids come from instance_number /
+	// instance_find and are converted with GetInstanceObject; the conversion is
+	// the step that used to be missing, which is why member reads all failed.
+	// See the comment on the implementation - InvokeWithObject was tried in its
+	// place and finds nothing on this runner.
 	std::vector<YYTK::RValue> FindInstances(const std::string& ObjectName);
+
+	// True when Value is something the runtime will accept as an instance.
+	// Guard anything crossing back into GML with this: a game script handed a
+	// bad value aborts the whole game rather than returning an error.
+	bool IsUsableInstance(const YYTK::RValue& Value);
 
 	// Name of the room the game is currently in. Empty on failure.
 	std::string CurrentRoomName();

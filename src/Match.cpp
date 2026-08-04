@@ -32,7 +32,14 @@ namespace hmd::match
 		constexpr const char* kEndOfActScript = "gml_Script_victory_ui_round_finish";
 		constexpr const char* kWaveScript = "gml_Script_matchup_get_enemies_to_fit";
 		constexpr const char* kRunStartScript = "gml_Script_new_run_start";
-		constexpr const char* kJumpToRoundScript = "gml_Script_jump_to_round";
+
+		// Present in this build, resolves cleanly, and must not be called. It is
+		// a progression routine that grants relics and updates collectible and
+		// star state on its way through, and it aborts the game when a mod calls
+		// it. AbandonDuel used to; the comment there has the stack trace. Kept
+		// named so the probe can still report on it and so nobody reintroduces
+		// the call without reading why it went.
+		// constexpr const char* kJumpToRoundScript = "gml_Script_jump_to_round";
 
 		// How long to wait for the peer's army before giving up and letting the
 		// round resolve normally, so a dropped peer cannot soft-lock the run.
@@ -158,7 +165,15 @@ namespace hmd::match
 		bool InRun()
 		{
 			const std::string room = bridge::CurrentRoomName();
-			return room == "rm_gameplay" || room == "rm_ranch";
+			const bool in_run = (room == "rm_gameplay" || room == "rm_ranch");
+
+			// Latched here because this is the one place that already knows what
+			// a run room is, and it is asked every tick. What it feeds is the
+			// "have we actually left the menu yet" test in the idle case.
+			if (in_run)
+				runstate::NoteInRunRoom();
+
+			return in_run;
 		}
 
 		// The stricter test: an army can actually be read out of the arena.
@@ -627,27 +642,19 @@ namespace hmd::match
 			if (enemies.empty())
 				return Outcome::LocalWon;
 
-			// The local side is beaten once every dude is knocked out.
-			bool any_standing = false;
-			for (const RValue& dude : dudes)
-			{
-				RValue knocked;
-				if (bridge::CallScriptAnnounced("gml_Script_dude_is_knocked_out", { dude }, knocked))
-				{
-					if (!knocked.ToBoolean())
-					{
-						any_standing = true;
-						break;
-					}
-				}
-				else
-				{
-					// If the script is unavailable, treat a live instance as
-					// standing rather than declaring a loss we cannot verify.
-					any_standing = true;
-					break;
-				}
-			}
+			// The local side is beaten once no dude instances are left standing.
+			//
+			// This used to ask dude_is_knocked_out per dude, every tick, for the
+			// whole duel. That script aborts the game on an argument it does not
+			// like, and it did exactly that on a tester's machine - see the note
+			// in Roster::CaptureLocalArmy. Live instances are counted instead.
+			//
+			// The difference that matters: if the game keeps knocked-out dudes
+			// as live instances, a loss is not detected until they are actually
+			// destroyed. So this can be slow to call a loss - it cannot call one
+			// that has not happened, and a slow local resolve falls through to
+			// the peer's own reported result rather than to a wrong answer.
+			const bool any_standing = !dudes.empty();
 
 			return any_standing ? Outcome::Undecided : Outcome::LocalLost;
 		}
@@ -688,33 +695,63 @@ namespace hmd::match
 			roster::ClearDefaultEnemyWave();
 		}
 
-		// Give the round back to the game after a gate times out. The boss was
-		// cleared to make room for a duel that never happened, so the round is
-		// rebuilt through the game's own round jump rather than left empty.
+		// Give the round back to the game after a gate fails.
+		//
+		// This used to call gml_Script_jump_to_round to rebuild the wave it had
+		// cleared, on the reasoning that re-entering the round regenerates it.
+		// It does - and it also re-runs everything else round entry does. A
+		// tester's game died inside it:
+		//
+		//     I32 argument is undefined
+		//     - gml_Script_gold_star_round:15
+		//     - gml_Script_collectibles_can_earn_credit:251
+		//     - gml_Script_collectible_set_discovered:48
+		//     - gml_Script_relic_acquire:966
+		//     - gml_Script_jump_to_round:10
+		//
+		// jump_to_round is a progression routine, not a wave builder. It grants
+		// relics and touches collectible and star bookkeeping, and that chain is
+		// not survivable when it is entered from a mod tick instead of from the
+		// game's own flow. Crashing the player is strictly worse than any state
+		// this function was trying to rescue them from, so it no longer calls it.
+		//
+		// What is left is honest: stop suppressing, then say what actually
+		// happened. If the sweep never destroyed anything the round is untouched
+		// and there is nothing to rescue. If it did, the wave is gone and no
+		// amount of mod-side cleverness brings it back - so the player is told
+		// plainly rather than being crashed on their behalf.
 		void AbandonDuel(const char* Reason)
 		{
-			ui::Notify("Duel called off - %s. Playing round %d normally.",
-				Reason, g_DuelRound);
-
 			roster::SetDefaultWaveSuppressed(false);
 
-			if (g_DuelRound > 0 && bridge::ScriptExists(kJumpToRoundScript))
+			const int cleared = roster::EnemiesCleared();
+			roster::ResetEnemiesCleared();
+
+			if (cleared <= 0)
 			{
-				// Re-entering the round regenerates the wave we cleared. Without
-				// this the player would be left standing in an empty arena with
-				// nothing to fight and no way to finish the round.
-				if (!bridge::CallScriptAnnounced(
-						kJumpToRoundScript,
-						{ RValue(static_cast<double>(g_DuelRound)) }))
+				// The common case, and the quiet one: the gate held an arena that
+				// was already empty. Nothing was taken from the player.
+				if (g_DuelRound > 0)
 				{
-					LogWarn("could not rebuild round %d - if the arena is empty, "
-						"leave the run and start a new one", g_DuelRound);
+					ui::Notify("Duel called off - %s. Playing round %d normally.",
+						Reason, g_DuelRound);
+				}
+				else
+				{
+					ui::Notify("Duel called off - %s. Playing on normally.", Reason);
 				}
 			}
-			else if (g_DuelRound > 0)
+			else
 			{
-				LogWarn("'%s' did not resolve - round %d may be left without a "
-					"wave", kJumpToRoundScript, g_DuelRound);
+				// The mod deleted this round's wave and the duel that was meant
+				// to replace it never happened. Nothing can put it back.
+				ui::Notify("Duel called off - %s. This round's enemies were "
+					"already cleared for the duel - leave the run and start a "
+					"new one.", Reason);
+
+				LogWarn("%d enemy instance(s) were cleared for a duel that did "
+					"not happen - round %d cannot be rebuilt (jump_to_round is "
+					"not safe to call; see AbandonDuel)", cleared, g_DuelRound);
 			}
 
 			// Do not immediately re-enter the gate on the same round.
@@ -914,6 +951,27 @@ namespace hmd::match
 		// the phase stuck and never start.
 		if (!net::IsConnected())
 		{
+			// Receiving from someone we are not connected to is not a
+			// contradiction - draining the inbound queue deliberately does not
+			// depend on our own link state - but it does mean the link is
+			// one-way, and a one-way link is invisible from this end: everything
+			// we can see about the opponent works, and nothing we send arrives.
+			//
+			// This is the shape of a real bug that took two playtests to find
+			// (see the LobbyCreated_t note in Steam.cpp). Say it out loud.
+			if (PeerPresenceFresh())
+			{
+				const auto now_check = std::chrono::steady_clock::now();
+				if (now_check - g_LastPresenceNag >= kPresenceNagInterval)
+				{
+					g_LastPresenceNag = now_check;
+					LogError("one-way link: %s's messages are arriving, but this "
+						"client is not connected (link=%s) so nothing we send "
+						"reaches them. They will see 'opponent ?'. Press F11 and "
+						"reconnect.", PeerLabel().c_str(), net::StateName());
+				}
+			}
+
 			if (phase != Phase::Offline)
 			{
 				if (phase != Phase::GameOver)
@@ -994,6 +1052,10 @@ namespace hmd::match
 				g_WaitStarted = now;
 				g_LastWaveClear = {};
 
+				// Counted per duel, so that calling one off can tell whether it
+				// is this duel that emptied the arena.
+				roster::ResetEnemiesCleared();
+
 				HoldArenaEmpty(now);
 
 				if (g_DuelRound > 0)
@@ -1019,8 +1081,27 @@ namespace hmd::match
 			// Back at the menu with a round still counted means the run ended -
 			// abandoned, lost, or finished. Stop reporting a round, so the next
 			// run starts counting from 1 rather than continuing.
-			if (round > 0 && bridge::CurrentRoomName() == "rm_mainmenu")
+			//
+			// The extra condition is not decoration. new_run_start fires while
+			// the player is still standing in rm_mainmenu, so for the frames
+			// between "run started - round 1" and the room actually changing,
+			// this read round > 0 in rm_mainmenu and immediately threw the count
+			// away again. The log of it:
+			//
+			//     02:06:52  run started - round 1
+			//     02:07:01  probe: round=0 (source: unresolved)
+			//     02:07:20  a round finished before any run start was seen
+			//
+			// The count only came back when the first round ended, so for the
+			// whole of round 1 the mod believed it was not in a run - and the
+			// duel gate needs round > 0, which is why round 2 never triggered
+			// one. Requiring that a run room has actually been seen since the
+			// run started makes "back at the menu" mean what it says.
+			if (round > 0 && !InRun() && runstate::HasBeenInRunRoom() &&
+				bridge::CurrentRoomName() == "rm_mainmenu")
+			{
 				runstate::NoteRunEnded();
+			}
 
 			// Neither side can exchange anything until both are actually in a
 			// run. Say so periodically rather than leaving the player guessing.
@@ -1119,6 +1200,31 @@ namespace hmd::match
 			// Halt normal progression while the exchange happens.
 			roster::SetDefaultWaveSuppressed(true);
 			HoldArenaEmpty(now);
+
+			// The gate that led here can have been open for up to five minutes,
+			// and this is the first thing after it that assumes the run is still
+			// where it was. It need not be: the arena is being held empty, so
+			// the game can decide the round is won and take the player back to
+			// the ranch, and their army goes with it.
+			//
+			// That is not a hypothetical. It is what happened to the tester whose
+			// log has "no live o_dude instances found - cannot capture army"
+			// seventy-three seconds into a gate. Checking the room first means
+			// that case is reported as what it is, rather than arriving as a
+			// capture failure that reads like the roster walk is broken.
+			if (!InGameplayRoom())
+			{
+				AbandonDuel("the round ended while waiting for your opponent");
+				SetPhase(Phase::Idle, "left the arena during the gate");
+				break;
+			}
+
+			if (!ArenaIsPopulated())
+			{
+				AbandonDuel("your army was gone by the time the duel started");
+				SetPhase(Phase::Idle, "arena emptied during the gate");
+				break;
+			}
 
 			if (!roster::CaptureLocalArmy(g_LocalArmy))
 			{

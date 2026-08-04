@@ -64,4 +64,26 @@ namespace hmd::duel
 
 		return Act * Interval;
 	}
+
+	// The inverse: how many acts a player has got through by the time they are
+	// standing on Round.
+	//
+	// This exists because the act used to be read out of the game, by calling
+	// gml_Script_get_act_number. That script calls gold_star_round internally,
+	// and gold_star_round aborts the game with "I32 argument is undefined" when
+	// it is entered from anywhere but the game's own progression flow - which is
+	// exactly what a mod calling it from a tick is. It crashed a tester twice in
+	// twenty seconds. The act is only ever displayed or logged, never used to
+	// gate anything, so deriving it from the round we already know is both safe
+	// and free.
+	//
+	// Floor, not ceiling, so that it round-trips with ProgressFromAct: round 20
+	// is the end of act 1, and ProgressFromAct(1) is 20.
+	inline int ActFromRound(int Round, int Interval)
+	{
+		if (Round <= 0 || !IsValidInterval(Interval))
+			return 0;
+
+		return Round / Interval;
+	}
 }
