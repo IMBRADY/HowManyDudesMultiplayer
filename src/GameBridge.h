@@ -133,6 +133,14 @@ namespace hmd::bridge
 	// place and finds nothing on this runner.
 	std::vector<YYTK::RValue> FindInstances(const std::string& ObjectName);
 
+	// Resolve any instance-shaped RValue into one members can be written to.
+	//
+	// Needed because every builtin that hands back an instance on this runner -
+	// instance_find, instance_create_depth - returns a VALUE_REF, and a ref
+	// cannot be read from or written to directly. Anything that creates an
+	// instance and then sets fields on it must go through this first.
+	bool AsInstance(const YYTK::RValue& Value, YYTK::RValue& Out);
+
 	// True when Value is something the runtime will accept as an instance.
 	// Guard anything crossing back into GML with this: a game script handed a
 	// bad value aborts the whole game rather than returning an error.

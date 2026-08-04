@@ -98,6 +98,12 @@ namespace
 	// says which part did not resolve.
 	constexpr int kKeyProbe = VK_F6;
 
+	// Deliberately its own key rather than part of F6. It runs the game's own
+	// matchup parser on the local machine, which loads a matchup - so it can
+	// disturb the round the player is standing in. Diagnostics should be free
+	// to press; this one is not, so it is not bundled with the ones that are.
+	constexpr int kKeySelfTest = VK_F5;
+
 	bool WasKeyPressed(int VirtualKey)
 	{
 		// GetAsyncKeyState's low bit reports "pressed since last call", which
@@ -440,6 +446,19 @@ namespace
 
 		if (WasKeyPressed(kKeyProbe))
 			hmd::probe::Report();
+
+		if (WasKeyPressed(kKeySelfTest))
+		{
+			if (hmd::bridge::CurrentRoomName() != "rm_gameplay")
+			{
+				hmd::LogWarn("F5 - the duel self-test needs a live round; press "
+					"it during a fight");
+			}
+			else
+			{
+				hmd::roster::SelfTestDuelPayload();
+			}
+		}
 	}
 
 	// Everything the mod does per-tick funnels through here.
@@ -793,7 +812,7 @@ EXPORTED AurieStatus ModuleInitialize(
 	if (hmd::steam::Available())
 	{
 		hmd::LogInfo("ready. F7 invite a Steam friend | F9 host | F10 join | "
-			"F11 disconnect | F8 status | F6 diagnostics");
+			"F11 disconnect | F8 status | F6 diagnostics | F5 duel self-test");
 		hmd::LogInfo("easiest way to play: press F7 twice - once to open a "
 			"lobby, again to pick a friend. No ports, works over the internet.");
 	}

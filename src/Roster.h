@@ -57,6 +57,31 @@ namespace hmd::roster
 		static bool Deserialize(const std::string& Text, Snapshot& Out);
 	};
 
+	// Turn a native round export into what the opponent should fight: our dudes
+	// moved into their enemies slot, our dudes cleared so they keep their own,
+	// and the sender's boss dropped because a duel replaces it.
+	//
+	// Both maps are type-name to count, so this is a rename rather than a
+	// translation. Empty string if the export cannot be transformed.
+	std::string BuildDuelPayload(const std::string& Export);
+
+	// Export the current round, transform it, and feed it to the game's own
+	// parser on this machine.
+	//
+	// The entire duel data path, end to end, on one machine. It answers the one
+	// question the format cannot: whether a dude type name means anything in the
+	// enemies map, or whether the two are separate namespaces. Worth doing
+	// before two people spend another session finding out.
+	void SelfTestDuelPayload();
+
+	// Run the game's own matchup exporter and report what it produced, without
+	// sending anything anywhere.
+	//
+	// On F6 rather than only inside a duel, because the whole feature now rides
+	// on this format and gating the one diagnostic that describes it behind "get
+	// a second player to round 2" is how several sessions were already lost.
+	void ProbeNativeExport();
+
 	// Walk live o_dude instances and build a snapshot of the local army.
 	// Returns false and logs if no army could be found (e.g. not in rm_gameplay).
 	bool CaptureLocalArmy(Snapshot& Out);

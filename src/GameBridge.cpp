@@ -44,57 +44,158 @@ namespace hmd::bridge
 			}
 		}
 
+		// Count an instance's members, stopping at the first one.
+		//
+		// Split in two so the guard below can exist: MSVC will not compile
+		// __try in a function that needs C++ unwinding, and the std::function
+		// this builds is exactly such an object.
+		int CountMembersUnsafe(const RValue& Value)
+		{
+			int count = 0;
+
+			g_Api->EnumInstanceMembers(
+				Value,
+				[&count](const char* Name, RValue*) -> bool
+				{
+					if (Name)
+						count++;
+
+					// Returning true stops the walk. One is proof enough.
+					return true;
+				}
+			);
+
+			return count;
+		}
+
+		// Members, or -1 if looking cost an access violation.
+		//
+		// The whole reason this exists: ToInstance() returns a NON-NULL pointer
+		// for a VALUE_REF which is not a valid CInstance*, and every way of
+		// checking whether a pointer is real involves reading through it. The
+		// previous build resolved a ref, logged "resolve via 'runtime pointer'",
+		// then died on the very next line enumerating its members.
+		//
+		// So the read is guarded and a fault is a return value. This is what
+		// makes it safe to *try* a candidate pointer rather than having to be
+		// right about it in advance - which four attempts have now shown is not
+		// something that can be reasoned out from this side.
+		int CountMembersGuarded(const RValue& Value)
+		{
+			__try
+			{
+				return CountMembersUnsafe(Value);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+				return -1;
+			}
+		}
+
 		// Turn whatever instance_find handed back into a CInstance*.
 		//
 		// instance_find on this runner returns kind 15, VALUE_REF - confirmed
 		// from a log, not assumed.
 		//
-		// The previous attempt read the RValue union's m_Instance directly for a
-		// ref and then "validated" the result by asking YYToolkit to enumerate
-		// its members. That killed the game outright, twice, with no GameMaker
-		// error and no stack trace - just a dead process, because for a ref
-		// those bytes are an id and flags rather than a pointer, and enumerating
-		// members dereferences whatever it is given.
+		// Four attempts have been spent here. What each one learned:
 		//
-		// The lesson, written down because it was expensive: **a pointer cannot
-		// be validated by dereferencing it.** The check was the crash.
+		//   1. Kept whatever instance_find returned. Members unreadable, and a
+		//      value handed to GML aborted the game.
+		//   2. Assumed ids, used GetInstanceObject. "could not be resolved".
+		//   3. Read the union's m_Instance raw and "validated" it by enumerating
+		//      members. Killed the process twice - enumerating IS a dereference,
+		//      so the check was the crash. **A pointer cannot be validated by
+		//      dereferencing it.**
+		//   4. Used ToInstance(), believing RV_ToPointer understands refs. It
+		//      returns a NON-NULL pointer that is not an instance. Logged
+		//      "resolve via 'runtime pointer'" and died on the next line.
 		//
-		// So nothing here reads the union as a pointer. Every pointer returned
-		// comes from a runtime call that is designed to produce one:
+		// So no candidate is trusted here, including the runtime's own. Each is
+		// tried, and accepted only if reading through it produces members - with
+		// that read guarded, so a wrong candidate costs a caught fault rather
+		// than the process. Being wrong is now cheap, which is the only property
+		// that has actually helped.
 		//
-		//   ToInstance()      -> RV_ToPointer, the runtime's own resolution,
-		//                        which understands what a ref is.
-		//   GetInstanceObject -> looks the id up in the room's instance list and
-		//                        fails cleanly when it is not there.
+		// Order is id-lookups first, pointer last: GetInstanceObject checks the
+		// room's instance list and fails cleanly, whereas ToInstance() lies.
 		//
 		// ToInt32 is RV_ToInt32, the conversion that aborts the game with "I32
 		// argument is undefined". It must never see an undefined, which is why
 		// the default case converts nothing at all.
 		CInstance* ResolveInstanceValue(const RValue& Value, const char*& HowOut)
 		{
+			// A candidate is only accepted if reading through it actually
+			// produces members, and that read is guarded, so a wrong candidate
+			// costs a caught fault instead of the process.
+			auto accept = [&](CInstance* Candidate, const char* How) -> CInstance*
+			{
+				if (!Candidate)
+					return nullptr;
+
+				if (CountMembersGuarded(RValue(Candidate)) > 0)
+				{
+					HowOut = How;
+					return Candidate;
+				}
+
+				return nullptr;
+			};
+
+			// An id that GetInstanceObject accepts is good, full stop.
+			//
+			// This deliberately does NOT require the result to enumerate any
+			// members, and the previous build's insistence that it must was
+			// throwing away correct pointers. EnumInstanceMembers works on the
+			// global instance - it lists hundreds - and returns zero for an
+			// ordinary instance, so "no members" says something about YYToolkit's
+			// enumeration, not about whether the pointer is real.
+			//
+			// The validation that matters already happened inside
+			// GetInstanceObject: it looks the id up in the current room's own
+			// instance list and returns AURIE_OBJECT_NOT_FOUND otherwise. There
+			// is nothing better available, and demanding more cost a session.
+			auto by_id = [&](int64_t Id, const char* How, bool& LookupOk) -> CInstance*
+			{
+				if (Id < 0 || Id > 0x7FFFFFFF)
+					return nullptr;
+
+				CInstance* instance = nullptr;
+				if (!AurieSuccess(g_Api->GetInstanceObject(
+						static_cast<int32_t>(Id), instance)) || !instance)
+					return nullptr;
+
+				LookupOk = true;
+				HowOut = How;
+				return instance;
+			};
+
 			switch (Value.m_Kind)
 			{
 			case VALUE_OBJECT:
 			case VALUE_PTR:
 			case VALUE_REF:
 			{
-				// Let the runtime resolve it. A ref is exactly what RV_ToPointer
-				// exists to unwrap.
-				if (CInstance* instance = Value.ToInstance())
-				{
-					HowOut = "runtime pointer";
-					return instance;
-				}
+				// A ref carries the instance id in its low 32 bits. Confirmed
+				// from a log, not inferred: o_gameplay came back as i32=100003
+				// with i64=0x0400000100018 6A3, and 0x186A3 is 100003. The
+				// 0x04000001 in the high dword is a type tag. GameMaker instance
+				// ids start at 100000, so this is exactly what it looks like.
+				//
+				// Order: id lookups first, because GetInstanceObject validates
+				// against the room's instance list. The runtime pointer comes
+				// LAST and is the only candidate still required to prove itself,
+				// because ToInstance() returns a non-null pointer for a ref that
+				// is not an instance - trusting it is what killed the game.
+				bool lookup_ok = false;
 
-				// A ref that would not unwrap may still name an id.
-				CInstance* by_id = nullptr;
-				const int32_t id = Value.ToInt32();
-				if (id >= 0 &&
-					AurieSuccess(g_Api->GetInstanceObject(id, by_id)) && by_id)
-				{
-					HowOut = "ref id lookup";
-					return by_id;
-				}
+				if (CInstance* found = by_id(Value.m_i32, "raw id", lookup_ok))
+					return found;
+
+				if (CInstance* found = by_id(Value.ToInt32(), "converted id", lookup_ok))
+					return found;
+
+				if (CInstance* found = accept(Value.ToInstance(), "runtime pointer"))
+					return found;
 
 				return nullptr;
 			}
@@ -108,14 +209,8 @@ namespace hmd::bridge
 				if (id < 0)
 					return nullptr;
 
-				CInstance* instance = nullptr;
-				if (AurieSuccess(g_Api->GetInstanceObject(id, instance)) && instance)
-				{
-					HowOut = "id lookup";
-					return instance;
-				}
-
-				return nullptr;
+				bool lookup_ok = false;
+				return by_id(id, "id lookup", lookup_ok);
 			}
 
 			default:
@@ -544,7 +639,13 @@ namespace hmd::bridge
 
 		int unresolved = 0;
 		int faulted = 0;
+		int kept_refs = 0;
 		int observed_kind = -1;
+
+		// Kept so a failure can report what it was actually looking at.
+		int32_t sample_i32 = 0;
+		int64_t sample_i64 = 0;
+		uint32_t sample_flags = 0;
 
 		for (int i = 0; i < count; i++)
 		{
@@ -557,15 +658,45 @@ namespace hmd::bridge
 				continue;
 
 			observed_kind = static_cast<int>(found->m_Kind);
+			sample_i32 = found->m_i32;
+			sample_i64 = found->m_i64;
+			sample_flags = found->m_Flags;
 
 			const char* how = "?";
 			CInstance* instance = ResolveInstanceGuarded(*found, how);
+
 			if (!instance)
 			{
 				if (how && strcmp(how, "faulted") == 0)
 					faulted++;
 
 				unresolved++;
+
+				// Keep the ref itself rather than dropping it.
+				//
+				// Converting a ref to a CInstance* has now failed every way it
+				// can be attempted - GetInstanceObject rejects the id,
+				// ToInstance() returns a pointer that faults. But conversion was
+				// never actually required: GetInstanceMember takes an RValue and
+				// GetMember already accepts VALUE_REF, so a ref can be read from
+				// directly without ever becoming a pointer.
+				//
+				// This is also what the original code did, and it never crashed
+				// - every crash in this area came from something I added to
+				// "fix" it. The field reads failed back then with "did not
+				// resolve to any known member name", which was read as proof the
+				// ref was useless. It is equally consistent with the NAMES being
+				// wrong, and that reading was never tested.
+				//
+				// Nothing here is dereferenced. If reads work, the mod works; if
+				// they do not, the name probe in LogInstanceMembers says so
+				// using x/y/id as controls.
+				if (found->m_Kind == VALUE_REF && found->m_Pointer)
+				{
+					kept_refs++;
+					instances.push_back(*found);
+				}
+
 				continue;
 			}
 
@@ -575,8 +706,21 @@ namespace hmd::bridge
 			static std::set<std::string> reported;
 			if (reported.insert(ObjectName).second)
 			{
+				// Two separate facts, reported separately, because conflating
+				// them is what caused the last round of wrong conclusions.
+				// Resolution succeeding says the pointer is real. Enumeration
+				// is a different question: it returns hundreds of members for
+				// the global instance and zero for an ordinary one, so a zero
+				// here means member *listing* is unavailable, NOT that the
+				// instance is bad. Field reads go through GetInstanceMember and
+				// may well work regardless.
+				const int members = CountMembersGuarded(RValue(instance));
+
 				LogInfo("instances of %s resolve via '%s' (instance_find kind "
-					"%d)", ObjectName.c_str(), how, observed_kind);
+					"%d); member enumeration yields %s",
+					ObjectName.c_str(), how, observed_kind,
+					members < 0 ? "a fault" :
+					members > 0 ? "members" : "nothing (listing unavailable)");
 			}
 
 			instances.emplace_back(instance);
@@ -587,6 +731,13 @@ namespace hmd::bridge
 			static std::set<std::string> complained;
 			if (complained.insert(ObjectName).second)
 			{
+				if (kept_refs > 0)
+				{
+					LogInfo("%s: %d instance(s) kept as refs and read directly - "
+						"no pointer conversion needed, and none possible on this "
+						"runner", ObjectName.c_str(), kept_refs);
+				}
+
 				// The kind is the whole point of this line. Two rewrites of this
 				// function have now been built on a guess about what
 				// instance_find hands back; naming it means the next one is not.
@@ -602,18 +753,59 @@ namespace hmd::bridge
 						"access violation that would have killed the game. The "
 						"guard held. Do not remove it.", faulted);
 				}
+
+				// Raw facts only. The previous version of this line asserted
+				// that GetInstanceObject had rejected the ids, which it had no
+				// way of knowing - the lookup may well have succeeded and been
+				// discarded by an over-strict acceptance test downstream. An
+				// overconfident diagnostic is worse than none, because it is
+				// believed. State what was seen, not what it means.
+				LogWarn("  the unresolved value raw: i32=%d i64=0x%llX "
+					"flags=0x%X (low 32 bits of i64 are the instance id)",
+					sample_i32,
+					static_cast<unsigned long long>(sample_i64),
+					sample_flags);
 			}
 		}
 
 		return instances;
 	}
 
+	bool AsInstance(const RValue& Value, RValue& Out)
+	{
+		if (!g_Api)
+			return false;
+
+		// Already resolved - FindInstances hands these out.
+		if (Value.m_Kind == VALUE_OBJECT && Value.m_Pointer)
+		{
+			Out = Value;
+			return true;
+		}
+
+		const char* how = "?";
+		CInstance* instance = ResolveInstanceGuarded(Value, how);
+		if (!instance)
+			return false;
+
+		Out = RValue(instance);
+		return true;
+	}
+
 	bool IsUsableInstance(const RValue& Value)
 	{
-		// VALUE_OBJECT with a live pointer is what FindInstances now produces.
-		// Anything else - and undefined above all - must never reach a game
-		// script: dude_is_knocked_out aborts the game on one.
-		return Value.m_Kind == VALUE_OBJECT && Value.m_Pointer != nullptr;
+		// Refs count. They are what this runner hands out for every instance and
+		// what FindInstances now keeps when conversion fails, which is always.
+		// GetInstanceMember accepts them, so they are readable even though they
+		// are not pointers.
+		//
+		// What this still excludes is the thing it was written for: undefined,
+		// and anything else that is not instance-shaped. Those must never reach
+		// a game script - dude_is_knocked_out aborts the whole game on one.
+		const bool instance_shaped =
+			Value.m_Kind == VALUE_OBJECT || Value.m_Kind == VALUE_REF;
+
+		return instance_shaped && Value.m_Pointer != nullptr;
 	}
 
 	std::string CurrentRoomName()
@@ -643,6 +835,101 @@ namespace hmd::bridge
 	{
 		if (!g_Api)
 			return;
+
+		// Look before walking. The full enumeration below is not guarded - it
+		// takes a capturing lambda and cannot be - so the guarded one-member
+		// probe runs first and this returns rather than dying if the value is
+		// not really readable. A build that printed this header and then killed
+		// the process is exactly why.
+		const int probe = CountMembersGuarded(Instance);
+		if (probe < 0)
+		{
+			LogError("cannot list members of %s - reading it raised an access "
+				"violation. The value is kind %d (%s) and is not a real "
+				"instance, whatever it claims to be.",
+				Label ? Label : "instance",
+				static_cast<int>(Instance.m_Kind),
+				KindName(static_cast<int>(Instance.m_Kind)));
+			return;
+		}
+
+		if (probe == 0)
+		{
+			// Enumeration is unavailable for ordinary instances on this runner -
+			// it lists hundreds for the global instance and nothing here. So
+			// names cannot be DISCOVERED. They can still be TESTED one at a
+			// time through GetInstanceMember, which is a different API and may
+			// work perfectly well.
+			//
+			// The built-ins come first and they are the control: every GameMaker
+			// instance has x, y, id and object_index. If those read, member
+			// access works and only the stat names below are wrong. If they do
+			// not, member access is unavailable entirely and no name will ever
+			// resolve - which is a completely different problem and worth not
+			// confusing with the first.
+			LogInfo("--- %s: enumeration unavailable, probing names directly ---",
+				Label ? Label : "instance");
+
+			static const char* kProbeNames[] = {
+				// Controls - every instance has these.
+				"x", "y", "id", "object_index", "depth", "sprite_index",
+				"image_index", "image_xscale", "visible",
+				// What the mod actually wants.
+				"type", "name", "level", "hp", "max_hp", "health", "max_health",
+				"hitpoints", "attack", "damage", "power", "speed", "move_speed",
+				"range", "attack_range", "crit_chance", "crit_damage",
+				"knocked_out", "unconscious", "is_knocked_out", "downed",
+				"dude_type", "dude", "team", "owner", "stats", "base_stats",
+				"dude_id", "index", "slot",
+			};
+
+			int found = 0;
+			for (const char* candidate : kProbeNames)
+			{
+				auto value = GetMember(Instance, candidate);
+				if (!value)
+					continue;
+
+				found++;
+
+				char rendered[96]{};
+				switch (value->m_Kind)
+				{
+				case VALUE_REAL:
+				case VALUE_INT32:
+				case VALUE_INT64:
+				case VALUE_BOOL:
+					_snprintf_s(rendered, sizeof(rendered) - 1, _TRUNCATE,
+						"%g", value->ToDouble());
+					break;
+				default:
+					_snprintf_s(rendered, sizeof(rendered) - 1, _TRUNCATE,
+						"<%s>", KindName(static_cast<int>(value->m_Kind)));
+					break;
+				}
+
+				LogInfo("    %-16s %-8s = %s", candidate,
+					KindName(static_cast<int>(value->m_Kind)), rendered);
+			}
+
+			LogInfo("--- %d of %zu probed name(s) exist on %s ---",
+				found, sizeof(kProbeNames) / sizeof(kProbeNames[0]),
+				Label ? Label : "instance");
+
+			if (found == 0)
+			{
+				LogWarn("not even x/y/id read back - member access is "
+					"unavailable on this instance entirely, which is a "
+					"different problem from having the wrong names. Raw: "
+					"kind %d (%s), i32 %d, i64 0x%llX.",
+					static_cast<int>(Instance.m_Kind),
+					KindName(static_cast<int>(Instance.m_Kind)),
+					Instance.m_i32,
+					static_cast<unsigned long long>(Instance.m_i64));
+			}
+
+			return;
+		}
 
 		LogInfo("--- members of %s ---", Label ? Label : "instance");
 

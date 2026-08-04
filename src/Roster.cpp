@@ -139,6 +139,95 @@ namespace hmd::roster
 		// what was already there and passes a structural check for a real
 		// matchup export. Nothing about the clipboard's contents is ever
 		// logged, for the same reason.
+		// What the game's own exporter produced, structurally.
+		//
+		// The whole duel now rides on this format, and nothing has ever logged
+		// it. Top-level keys and array sizes are enough to write the injection
+		// side against - specifically whether "dudes" and "enemies" are separate
+		// arrays, because our dudes have to arrive as the opponent's enemies and
+		// that is a swap the mod has to perform.
+		//
+		// Values are deliberately not logged. This is a serialisation of the
+		// player's run and it goes to the log, not to a peer.
+		void DescribeMatchupExport(const std::string& Export)
+		{
+			json::Value root;
+			if (!json::Parse(Export, root) || !root.IsObject())
+			{
+				LogWarn("the native export is not a JSON object - first 80 "
+					"bytes: %.80s", Export.c_str());
+				return;
+			}
+
+			LogInfo("--- native matchup export: structure ---");
+
+			for (const auto& [name, member] : root.Members())
+			{
+				if (member.IsArray())
+				{
+					LogInfo("    %-16s array[%zu]", name.c_str(),
+						member.Items().size());
+				}
+				else if (member.IsObject())
+				{
+					LogInfo("    %-16s object", name.c_str());
+				}
+				else
+				{
+					LogInfo("    %-16s scalar", name.c_str());
+				}
+			}
+
+			// The two that matter. Our dudes have to arrive as the opponent's
+			// enemies, and writing that transform needs to know how each side is
+			// keyed and what an entry looks like.
+			//
+			// Keys and one entry's field names only - not values. This is a
+			// serialisation of the player's whole run, and the schema is what is
+			// actually needed.
+			for (const char* section : { "dudes", "enemies" })
+			{
+				const json::Value& node = root[section];
+				if (!node.IsObject())
+					continue;
+
+				LogInfo("--- '%s' keys ---", section);
+
+				int shown = 0;
+				for (const auto& [key, entry] : node.Members())
+				{
+					if (shown++ >= 8)
+					{
+						LogInfo("    ... and more");
+						break;
+					}
+
+					LogInfo("    %s -> %s", key.c_str(),
+						entry.IsObject() ? "object" :
+						entry.IsArray() ? "array" : "scalar");
+				}
+
+				// One entry's shape, which is the schema an injected unit has to
+				// match.
+				for (const auto& [key, entry] : node.Members())
+				{
+					if (!entry.IsObject())
+						break;
+
+					LogInfo("    fields of '%s':", key.c_str());
+					for (const auto& [field, value] : entry.Members())
+					{
+						LogInfo("        %-20s %s", field.c_str(),
+							value.IsObject() ? "object" :
+							value.IsArray() ? "array" : "scalar");
+					}
+					break;
+				}
+			}
+
+			LogInfo("--- end of structure ---");
+		}
+
 		std::string CaptureGameNativeExport()
 		{
 			constexpr const char* kExport = "gml_Script_current_round_to_custom_matchup_clipboard";
@@ -195,14 +284,24 @@ namespace hmd::roster
 				return {};
 			}
 
-			// Unchanged clipboard means the exporter did not run. Whatever is
-			// sitting there belongs to the player, not to this mod.
+			// An unchanged clipboard used to mean "the exporter did not run", and
+			// the contents were discarded as the player's own.
+			//
+			// That test misfires, and it was seen misfiring: press F6 twice in
+			// the same round and the second export is byte-identical to the
+			// first, which is still sitting on the clipboard. A perfectly good
+			// export was thrown away with "left the clipboard unchanged".
+			//
+			// What actually matters is not whether the text changed but whether
+			// it is a matchup payload, and the check below already answers that
+			// - a player's clipboard is overwhelmingly unlikely to contain
+			// something carrying the exporter's own keys. So unchanged text is
+			// merely noted, and the structural test decides.
 			if (had_previous && exported == previous)
 			{
-				LogWarn("native matchup export left the clipboard unchanged - "
-					"discarding it rather than transmitting the player's own "
-					"clipboard contents");
-				return {};
+				LogInfo("the export matches what was already on the clipboard - "
+					"expected when exporting the same round twice; the payload "
+					"check below decides whether it is real");
 			}
 
 			if (!sanitize::IsMatchupPayload(exported))
@@ -355,6 +454,170 @@ namespace hmd::roster
 		return true;
 	}
 
+	// Turn JSON text into a GML struct the game's own routines will accept.
+	//
+	// custom_matchup_parse is named for what it does to a matchup, not to a
+	// string: hand it text and it dies at struct_merge_shallow:23 with
+	// "struct_get_names argument 1 incorrect type (string) expecting a Number".
+	// It wants the struct, already parsed. json_parse is the game's own way of
+	// producing one.
+	//
+	// Returns nothing rather than an undefined RValue on failure. Undefined is
+	// the argument that aborts the runtime, so it must never leave here.
+	std::optional<RValue> ParseJsonToStruct(const std::string& Text)
+	{
+		if (Text.empty())
+			return std::nullopt;
+
+		auto parsed = bridge::CallBuiltin("json_parse", { RValue(Text) });
+		if (!parsed)
+			return std::nullopt;
+
+		// A struct arrives as an object or, on this runner, a ref.
+		const bool struct_shaped =
+			parsed->m_Kind == VALUE_OBJECT || parsed->m_Kind == VALUE_REF;
+
+		if (!struct_shaped || !parsed->m_Pointer)
+		{
+			LogWarn("json_parse returned kind %d rather than a struct - not "
+				"passing it on", static_cast<int>(parsed->m_Kind));
+			return std::nullopt;
+		}
+
+		return *parsed;
+	}
+
+	std::string BuildDuelPayload(const std::string& Export)
+	{
+		json::Value root;
+		if (!json::Parse(Export, root) || !root.IsObject())
+			return {};
+
+		const json::Value& dudes = root["dudes"];
+		if (!dudes.IsObject() || dudes.Members().empty())
+		{
+			LogWarn("the export has no 'dudes' to turn into an opposing army");
+			return {};
+		}
+
+		// The whole duel, as a data transform.
+		//
+		// Both 'dudes' and 'enemies' are maps of type name to count - {"basic":1}
+		// and {"toddler":9}, matching NUM_DUDES_ACTIVE and NUM_ENEMIES_ACTIVE
+		// exactly. So "fight my army" is precisely: put my dudes where your
+		// enemies go.
+		//
+		// The one thing this cannot verify from here is whether a dude type name
+		// is meaningful in the enemies map. They may be separate namespaces, in
+		// which case the parse will reject it or spawn nothing - which is what
+		// SelfTestDuelPayload exists to find out, on one machine, before two
+		// people spend a session on it.
+		json::Value out = root;
+		out.Set("enemies", dudes);
+
+		// Only the army crosses. The boss and the alternate enemy list belong to
+		// whatever round the sender happened to be on, and a duel replaces the
+		// boss rather than adding to it.
+		out.Set("non_boss_enemies", json::Value::Object());
+		out.Set("boss_fight_id", json::Value(0.0));
+
+		// The receiver keeps their own dudes - they are fighting with their army,
+		// not adopting ours.
+		out.Set("dudes", json::Value::Object());
+
+		return out.Serialize();
+	}
+
+	void SelfTestDuelPayload()
+	{
+		LogInfo("--- duel payload self-test ---");
+
+		const std::string exported = CaptureGameNativeExport();
+		if (exported.empty())
+		{
+			LogWarn("self-test: nothing exported - cannot continue");
+			return;
+		}
+
+		const std::string payload = BuildDuelPayload(exported);
+		if (payload.empty())
+		{
+			LogWarn("self-test: the transform produced nothing");
+			return;
+		}
+
+		LogInfo("self-test: transformed %zu bytes into a %zu byte duel payload",
+			exported.size(), payload.size());
+
+		if (!sanitize::IsMatchupPayload(payload))
+		{
+			LogWarn("self-test: the transformed payload no longer looks like a "
+				"matchup - the transform broke its shape");
+			return;
+		}
+
+		// Describe what is about to be handed over, so a rejection can be read
+		// against what caused it.
+		DescribeMatchupExport(payload);
+
+		if (!bridge::ScriptExists("gml_Script_custom_matchup_parse"))
+		{
+			LogWarn("self-test: custom_matchup_parse does not exist - the "
+				"injection half of the duel has no route at all");
+			return;
+		}
+
+		// json_parse first. custom_matchup_parse wants the struct, not the text.
+		auto as_struct = ParseJsonToStruct(payload);
+		if (!as_struct)
+		{
+			LogWarn("self-test: the payload could not be turned into a struct - "
+				"custom_matchup_parse cannot be called without one");
+			return;
+		}
+
+		LogInfo("self-test: handing it to the game's own parser now. If the game "
+			"stops here, dude types are not valid enemy types and the duel needs "
+			"a different shape.");
+
+		RValue parsed;
+		if (!bridge::CallScriptAnnounced(
+				"gml_Script_custom_matchup_parse", { *as_struct }, parsed))
+		{
+			LogWarn("self-test: custom_matchup_parse could not be called");
+			return;
+		}
+
+		LogInfo("self-test: parser returned kind %d - %s",
+			static_cast<int>(parsed.m_Kind),
+			parsed.m_Kind == VALUE_UNDEFINED
+				? "undefined, meaning it REJECTED the payload"
+				: "something, meaning it ACCEPTED the payload");
+
+		LogInfo("--- end of duel payload self-test ---");
+	}
+
+	void ProbeNativeExport()
+	{
+		const std::string exported = CaptureGameNativeExport();
+
+		if (exported.empty())
+		{
+			LogWarn("probe: the native matchup export produced nothing. With "
+				"instance members unreadable on this build, that leaves no way "
+				"to capture an army at all.");
+			return;
+		}
+
+		LogInfo("probe: native matchup export produced %zu bytes",
+			exported.size());
+
+		LogInfo("probe: it %s a plausible matchup payload by the sanitiser's "
+			"own test", sanitize::IsMatchupPayload(exported) ? "IS" : "is NOT");
+
+		DescribeMatchupExport(exported);
+	}
+
 	// -----------------------------------------------------------------------
 	// Capture
 	// -----------------------------------------------------------------------
@@ -436,26 +699,56 @@ namespace hmd::roster
 				skipped_unusable, dudes.size());
 		}
 
-		// Every instance being unreadable is a different failure from there
-		// being no army, and it must not be reported as a successful capture of
-		// nothing: that would send an empty army and hand the opponent a free
-		// win. Fail, and let the caller call the duel off.
-		if (Out.units.empty())
+		// The native export is the army now, not a bonus on top of one.
+		//
+		// Reading per-unit stats off instances is finished as an approach on
+		// this build: instance refs cannot be converted to pointers, and
+		// GetInstanceMember returns nothing for a ref - not for `type` or
+		// `level`, and not for `x`, `y` or `id` either. Nought of thirty-nine
+		// probed names exist. The per-unit path below therefore produces a
+		// correctly-shaped list of units with default stats, which is worse than
+		// useless if it is what gets sent.
+		//
+		// current_round_to_custom_matchup_clipboard is the game serialising its
+		// own round - dudes, enemies, relics, cash, the lot - and
+		// custom_matchup_parse reads that format back. Neither needs the mod to
+		// understand a single field. InjectOpponentArmy already prefers this
+		// path; it has simply never been reached, because capture kept failing
+		// before it got here.
+		// Transformed before it is stored, so what crosses the wire is already
+		// "fight this army" rather than "here is my whole round". The receiver
+		// hands it straight to custom_matchup_parse and does not have to know
+		// anything about the format.
+		const std::string exported = CaptureGameNativeExport();
+		Out.matchup = exported.empty() ? std::string{} : BuildDuelPayload(exported);
+
+		if (!Out.matchup.empty())
 		{
-			LogWarn("none of the %zu o_dude instance(s) could be read - not "
-				"sending an empty army", dudes.size());
-			return false;
+			LogStage(kStageSerialize,
+				"native export captured: %zu bytes, %zu unit shell(s) alongside "
+				"it. The export is what gets sent.",
+				Out.matchup.size(), Out.units.size());
+
+			// What the exporter actually produced, so the injection side can be
+			// written against the real shape rather than a guess at it. Logged
+			// once - it is large.
+			static bool described = false;
+			if (!described)
+			{
+				described = true;
+				DescribeMatchupExport(Out.matchup);
+			}
+
+			return true;
 		}
 
-		Out.matchup = CaptureGameNativeExport();
+		// No export and no readable members leaves nothing worth sending.
+		// Reporting success here would transmit an army of zero-stat units and
+		// hand the opponent a free win, which is worse than calling the duel off.
+		LogWarn("the native matchup export produced nothing, and per-unit stats "
+			"cannot be read on this build - there is no army to send");
 
-		LogStage(kStageSerialize,
-			"captured %zu unit(s); native export %s (%zu bytes)",
-			Out.units.size(),
-			Out.matchup.empty() ? "unavailable" : "captured",
-			Out.matchup.size());
-
-		return true;
+		return false;
 	}
 
 	// -----------------------------------------------------------------------
@@ -519,10 +812,17 @@ namespace hmd::roster
 			sanitize::IsMatchupPayload(Peer.matchup) &&
 			bridge::ScriptExists("gml_Script_custom_matchup_parse"))
 		{
+			// Struct, not text. Handing the string straight over dies inside
+			// struct_merge_shallow - see ParseJsonToStruct. The structural check
+			// above still runs on the TEXT, before any of it reaches the game,
+			// which is where a peer-supplied payload should be judged.
+			auto as_struct = ParseJsonToStruct(Peer.matchup);
+
 			RValue parsed;
-			if (bridge::CallScriptAnnounced(
+			if (as_struct &&
+				bridge::CallScriptAnnounced(
 					"gml_Script_custom_matchup_parse",
-					{ RValue(Peer.matchup) },
+					{ *as_struct },
 					parsed) &&
 				parsed.m_Kind != VALUE_UNDEFINED)
 			{
@@ -573,13 +873,33 @@ namespace hmd::roster
 				continue;
 			}
 
+			// instance_create_depth returns a VALUE_REF on this runner, exactly
+			// as instance_find does, and a ref cannot be written to. Without
+			// this the spawn succeeds and every single attribute write below
+			// silently does nothing - an arena full of default enemies that
+			// look like the peer's army and are not.
+			RValue target;
+			if (!bridge::AsInstance(*created, target))
+			{
+				static bool warned = false;
+				if (!warned)
+				{
+					warned = true;
+					LogWarn("spawned enemies cannot be resolved to instances - "
+						"the opponent's army will arrive with default stats");
+				}
+
+				spawned++;
+				continue;
+			}
+
 			// Best-effort attribute transfer. Each write is independent: a
 			// member the runtime does not expose is skipped, not fatal.
 			auto write = [&](const char* logical, double value)
 			{
-				const std::string* member = ResolveField(*created, logical);
+				const std::string* member = ResolveField(target, logical);
 				if (member)
-					bridge::SetMember(*created, *member, RValue(value));
+					bridge::SetMember(target, *member, RValue(value));
 			};
 
 			write("level", unit.level);

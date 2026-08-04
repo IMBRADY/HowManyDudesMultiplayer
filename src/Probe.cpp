@@ -4,6 +4,7 @@
 #include "GameBridge.h"
 #include "Log.h"
 #include "Match.h"
+#include "Roster.h"
 #include "RunState.h"
 #include "Ui.h"
 
@@ -153,6 +154,43 @@ namespace hmd::probe
 
 			bridge::LogInstanceMembers(gameplay.front(), "o_gameplay");
 		}
+
+		// The member names of the combatant objects.
+		//
+		// This is the single most valuable thing the probe can produce and until
+		// now it was unreachable: the only dump of o_dude lived inside
+		// CaptureLocalArmy, which only runs during a duel, which needs a second
+		// player and a duel round. The names it would print are what every
+		// "field 'x' did not resolve to any known member name" warning is asking
+		// for, and they cannot be recovered from data.win because this is a YYC
+		// build with no VARI chunk.
+		//
+		// So it is on F6 instead, where one person alone standing in a fight can
+		// produce it.
+		void ReportCombatantMembers()
+		{
+			for (const char* object : { "o_dude", "o_enemy" })
+			{
+				std::vector<RValue> instances = bridge::FindInstances(object);
+
+				if (instances.empty())
+				{
+					LogInfo("probe: no live %s to inspect - press F6 during a "
+						"fight, not in the ranch or the menu", object);
+					continue;
+				}
+
+				LogInfo("probe: %zu live %s instance(s); listing the first",
+					instances.size(), object);
+
+				bridge::LogInstanceMembers(instances.front(), object);
+			}
+
+			// Only meaningful mid-round, and it is the one remaining route to
+			// an army now that instance members have proved unreadable.
+			if (bridge::CurrentRoomName() == "rm_gameplay")
+				roster::ProbeNativeExport();
+		}
 	}
 
 	void NoteCodeEntry(CCode* Code)
@@ -216,6 +254,7 @@ namespace hmd::probe
 		runstate::Report();
 		match::Report();
 		ReportGameplayObject();
+		ReportCombatantMembers();
 		ReportGameplayMembers();
 		ReportGlobals();
 
