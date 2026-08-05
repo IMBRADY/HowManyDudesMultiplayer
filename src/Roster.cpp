@@ -660,75 +660,59 @@ namespace hmd::roster
 			return {};
 		}
 
-		// The whole duel, as a data transform.
+		// The round-robin translation that used to live here is GONE.
 		//
-		// Both 'dudes' and 'enemies' are maps of type name to count - {"basic":1}
-		// and {"toddler":9}, matching NUM_DUDES_ACTIVE and NUM_ENEMIES_ACTIVE
-		// exactly. So "fight my army" wants to be: put my dudes where your
-		// enemies go.
+		// It mapped each dude type onto a harvested enemy name because
+		// `"enemies":{"basic":1}` aborts the runtime where
+		// `"enemies":{"toddler":1}` does not. That measurement stands. What was
+		// wrong was the conclusion drawn from it - it is a fact about the
+		// matchup format, and injection stopped going through the matchup
+		// format several sessions ago.
 		//
-		// It cannot be, and this is measured rather than assumed. Two bisect
-		// stages differing in one word:
+		// Measured at 13:43:46, one press, with a control:
 		//
-		//     "enemies":{"toddler":1}   parsed, game lived
-		//     "enemies":{"basic":1}     I32 argument is undefined, game died
+		//     dude_generate("basic")                 -> record, hp 100
+		//     record.combatant_type = 1              (an enemy's value)
+		//     global.ANIMALS[record.id] = record     (enemy_spawn reads here)
+		//     enemy_spawn(record.id, x, y)
 		//
-		// Dude types are not enemy types. The army has to be translated into the
-		// enemy vocabulary on the way out.
-		const json::Value& enemies = root["enemies"];
-
-		// Learn from this export before using it. The round the sender is
-		// standing in names the enemies it is fighting, and those are real by
-		// construction.
+		//     o_enemy instances    10 -> 11
+		//     NUM_ENEMIES_ACTIVE   10 -> 11
+		//
+		// So a dude spawns as a counted enemy, and the army no longer needs
+		// translating to cross. See SpawnOneInjectedUnit.
+		//
+		// The harvest below is KEPT even though the translation is gone. The
+		// vocabulary file is still what ResolveInjectableType reads to find a
+		// legal enemy type for the probes, and every name in it was named by a
+		// real export, so it costs one pass over a map already in hand.
 		std::vector<std::string> from_this_round;
-		for (const auto& [type, count] : enemies.Members())
+		for (const auto& [type, count] : root["enemies"].Members())
 			from_this_round.push_back(type);
 		for (const auto& [type, count] : root["non_boss_enemies"].Members())
 			from_this_round.push_back(type);
 
 		RememberEnemyTypes(from_this_round);
 
-		// Prefer what this round is already fighting - those names are known
-		// good in a live round right now - and fall back to everything seen in
-		// earlier rounds.
-		std::vector<std::string> vocabulary = from_this_round;
-		for (const std::string& name : LoadEnemyVocabulary())
-		{
-			if (std::find(vocabulary.begin(), vocabulary.end(), name) ==
-				vocabulary.end())
-				vocabulary.push_back(name);
-		}
-
-		if (vocabulary.empty())
-		{
-			LogWarn("no enemy type name has been seen yet, so this army cannot "
-				"be expressed as a wave - no duel payload this round");
-			return {};
-		}
-
-		// Each dude type takes an enemy type, round-robin, in a stable order.
-		// Counts are preserved, so the wave the opponent fights has the size and
-		// the shape of the sending army even though the identities differ.
-		//
-		// This is an approximation and is meant to read as one: a five-dude army
-		// arrives as five enemies in the same groupings, not as five of its own
-		// dudes. Per-type fidelity needs a real dude-to-enemy correspondence,
-		// which needs the enemy namespace enumerated, which the vocabulary file
-		// is slowly accumulating.
-		json::Value translated = json::Value::Object();
-		size_t next = 0;
-
-		for (const auto& [dude_type, count] : dudes.Members())
-		{
-			const std::string& enemy_type = vocabulary[next % vocabulary.size()];
-			next++;
-
-			const double already = translated[enemy_type].AsNumber();
-			translated.Set(enemy_type, json::Value(already + count.AsNumber()));
-		}
-
 		json::Value out = root;
-		out.Set("enemies", translated);
+
+		// THE ARMY CROSSES AS ITSELF.
+		//
+		// `dudes` is left exactly as the exporter wrote it, and `enemies` is
+		// emptied. The receiver spawns from `dudes` through dude_generate, so
+		// the opponent fights the actual roster - a "basic" arrives as a basic
+		// with hp 100, not as a toddler with hp 18.
+		//
+		// The translation this replaces existed because
+		// `"enemies":{"basic":1}` aborts the runtime. That is still true, and
+		// it is still a fact about the MATCHUP FORMAT - which stopped being how
+		// injection works several sessions ago. Nothing here goes near
+		// custom_matchup_parse; InjectOpponentArmy reads this map itself.
+		//
+		// `enemies` is cleared rather than left alone so there is exactly one
+		// army in the document. A payload naming both would leave the receiver
+		// choosing, and the sender's round filler is not part of the duel.
+		out.Set("enemies", json::Value::Object());
 
 		// Only the army crosses. The boss and the alternate enemy list belong to
 		// whatever round the sender happened to be on, and a duel replaces the
@@ -743,16 +727,12 @@ namespace hmd::roster
 		// exactly, with every other field left alone.
 		out.Set("boss_fight_id", json::Value(std::string{}));
 
-		// The receiver keeps their own dudes - they are fighting with their army,
-		// not adopting ours.
-		//
-		// roster_order goes with them. It is the dudes' ordering - a live export
-		// pairs "dudes":{"basic":1.0} with "roster_order":["basic"] - so leaving
-		// it populated beside an empty roster describes an army that is not
-		// there. Whether the game minds is what stage 4 asks; it is cleared here
-		// because a document that contradicts itself has no reason to be sent.
-		out.Set("dudes", json::Value::Object());
-		out.Set("roster_order", json::Value::Array());
+		// `dudes` and `roster_order` are both left as the exporter wrote them.
+		// roster_order is the dudes' ordering - a live export pairs
+		// "dudes":{"basic":1.0} with "roster_order":["basic"] - so the two move
+		// together or the document contradicts itself. The previous version
+		// emptied both because the army travelled in `enemies`; it travels in
+		// `dudes` now, so they stay.
 
 		return out.Serialize();
 	}
@@ -2313,6 +2293,39 @@ namespace hmd::roster
 				{ RValue(Name), RValue(static_cast<double>(Value)) }).has_value();
 		}
 
+		// Put a counter back where it was found, reporting rather than assuming.
+		//
+		// -1 from ReadGlobalCount means unreadable, and there is then no
+		// trustworthy value to aim at - correcting towards a guess is worse than
+		// leaving it alone and saying so.
+		void RestoreCountIfMoved(const char* Name, int Before)
+		{
+			if (Before < 0)
+			{
+				SelfTestWarn("    [6] %s could not be read before this ran, so "
+					"it cannot be corrected now", Name);
+				return;
+			}
+
+			const int now = ReadGlobalCount(Name);
+			if (now == Before)
+				return;
+
+			SelfTestWarn("    [6] %s is %d and should be %d - restoring it",
+				Name, now, Before);
+
+			RestoreGlobalCount(Name, Before);
+
+			const int settled = ReadGlobalCount(Name);
+
+			if (settled != Before)
+			{
+				SelfTestWarn("    [6] %s IS STILL %d. Restart the run - this "
+					"one will fail at the victory screen or refuse to end",
+					Name, settled);
+			}
+		}
+
 		bool RegistryRemove(const char* GlobalName, const std::string& Key)
 		{
 			auto registry = bridge::GetGlobal(GlobalName);
@@ -2327,6 +2340,54 @@ namespace hmd::roster
 
 			return bridge::CallBuiltin("variable_struct_remove",
 				{ *registry, RValue(Key) }).has_value();
+		}
+
+		// The `.id` a generator wrote into its record, which is the registry key.
+		std::string RecordKey(const RValue& Record)
+		{
+			auto id = bridge::CallBuiltin("variable_struct_get",
+				{ Record, RValue("id") });
+
+			if (!id || id->m_Kind != VALUE_STRING || !id->ToCString())
+				return {};
+
+			return id->ToCString();
+		}
+
+		// Undo a generator call: drop the record and its alive flag.
+		//
+		// This does NOT call animal_delete, and that is the whole point.
+		//
+		//     13:29:34  gml_Script_animal_delete(1 args) = str("r16")
+		//               I32 argument is undefined
+		//               gml_Script_animal_delete:47
+		//
+		// `animal_delete` works on a record that HAS BEEN SPAWNED - the removal
+		// path calls it on live and on just-destroyed units and it survives
+		// both. A record straight out of a generator has never been spawned,
+		// carries `.instance = -4` (`noone`), and :47 converts that to an I32
+		// and aborts. A cleanup helper called it anyway and killed the game
+		// AFTER the probe using it had answered every one of its questions.
+		//
+		// So removal here is pure struct surgery: variable_struct_remove
+		// against the registries, which is not GML the game wrote and cannot
+		// abort. `dude_delete` exists (top_functions.txt:1307) and is not used
+		// for the same reason - it is presumed to have the same precondition,
+		// and presuming is free where calling is not.
+		//
+		// All three registries are cleared regardless of which one the record
+		// landed in: dude_generate registers into DUDES, animal_generate into
+		// ANIMALS and ANIMALS_CONSCIOUS, and an injected unit has been written
+		// into all three by hand. Removing a key that is not there is not an
+		// error.
+		void ForgetGeneratedRecord(const std::string& Key)
+		{
+			if (Key.empty())
+				return;
+
+			RegistryRemove("ANIMALS", Key);
+			RegistryRemove("ANIMALS_CONSCIOUS", Key);
+			RegistryRemove("DUDES", Key);
 		}
 
 		// Render a registry answer without pretending unreadable means absent.
@@ -2472,7 +2533,7 @@ namespace hmd::roster
 		// one. AbandonDuel has to be able to put the round back.
 		struct InjectedUnit
 		{
-			std::string key;      // the ANIMALS key animal_generate chose
+			std::string key;      // the registry key the generator chose
 			RValue instance;      // what enemy_spawn returned
 		};
 
@@ -2481,6 +2542,22 @@ namespace hmd::roster
 		// NUM_ENEMIES_ACTIVE as it stood before the mod spawned anything. The
 		// value removal has to get back to.
 		int g_EnemiesBeforeInjection = -1;
+
+		// NUM_DUDES_ACTIVE, same purpose, and it is not redundant.
+		//
+		// The opponent's army is spawned from DUDE records, and a dude spawned
+		// through enemy_spawn increments BOTH counters - measured 13:43:46,
+		// NUM_ENEMIES_ACTIVE 10 -> 11 alongside NUM_DUDES_ACTIVE 1 -> 2. The
+		// enemy count is wanted, because that is what makes the round wait for
+		// the unit. The dude count is not: the opponent's army is not part of
+		// the local player's roster, and leaving it inflated is what produced
+		//
+		//     I32 argument is undefined
+		//     gml_Script_scoreboard_data_set:37
+		//     gml_Script_victory_ui_spawn:9
+		//
+		// at the end of the round that first spawned one.
+		int g_DudesBeforeInjection = -1;
 
 		// A peer cannot be trusted to size our arena.
 		constexpr int kMaxUnitsPerType = 40;
@@ -2524,13 +2601,119 @@ namespace hmd::roster
 
 		// One unit, by the game's own two calls. Returns false without leaving
 		// anything behind if it could not be built.
-		bool SpawnOneInjectedUnit(const std::string& Type, double X, double Y)
+		// What an enemy record carries in .combatant_type, and an alive flag
+		// the game itself wrote. Both are read off a real enemy record rather
+		// than constructed here.
+		//
+		// This is not fussiness. RValue(1) is a VALUE_INT64 and the game may
+		// store a VALUE_BOOL; writing the wrong kind into a registry the
+		// runtime reads is the class of mistake that produces an "argument is
+		// undefined" abort three call frames away from the cause. The game can
+		// supply both values, so it does.
+		struct EnemyMarkers
 		{
-			RValue record;
+			RValue combatant_type;
+			RValue conscious;
+			bool have_combatant_type = false;
+			bool have_conscious = false;
+		};
+
+		EnemyMarkers ReadEnemyMarkers()
+		{
+			EnemyMarkers markers;
+
+			std::string source;
+			const std::string enemy_type = ResolveInjectableType(source);
+
+			if (enemy_type.empty())
+			{
+				LogWarn("no enemy type name is available, so the marker values "
+					"an injected unit needs cannot be read from the game");
+				return markers;
+			}
+
+			RValue control;
 			if (!bridge::CallScript("gml_Script_animal_generate",
+					{ RValue(enemy_type) }, control))
+			{
+				LogWarn("animal_generate(\"%s\") could not be called for the "
+					"marker values", enemy_type.c_str());
+				return markers;
+			}
+
+			auto type_value = bridge::CallBuiltin("variable_struct_get",
+				{ control, RValue("combatant_type") });
+
+			if (type_value && type_value->m_Kind != VALUE_UNDEFINED)
+			{
+				markers.combatant_type = *type_value;
+				markers.have_combatant_type = true;
+			}
+
+			// animal_generate registers its record in both registries, so the
+			// control's own key is a guaranteed ANIMALS_CONSCIOUS entry to copy
+			// from - which matters because ClearDefaultEnemyWave may have just
+			// emptied the round of anything else to read.
+			const std::string control_key = RecordKey(control);
+
+			if (!control_key.empty())
+			{
+				auto flag = RegistryGet("ANIMALS_CONSCIOUS", control_key);
+
+				if (flag && flag->m_Kind != VALUE_UNDEFINED)
+				{
+					markers.conscious = *flag;
+					markers.have_conscious = true;
+				}
+			}
+
+			// The control was only ever a source of two values.
+			ForgetGeneratedRecord(control_key);
+
+			LogInfo("marker values read from a live \"%s\" record: "
+				"combatant_type %s, alive flag %s", enemy_type.c_str(),
+				markers.have_combatant_type ? "ok" : "MISSING",
+				markers.have_conscious ? "ok" : "MISSING");
+
+			return markers;
+		}
+
+		// Spawn one unit of the opponent's army, as itself.
+		//
+		//     record = dude_generate(type)                 real dude, real stats
+		//     record.combatant_type = <an enemy's value>   makes it hostile
+		//     global.ANIMALS[record.id] = record           enemy_spawn reads here
+		//     global.ANIMALS_CONSCIOUS[record.id] = alive
+		//     enemy_spawn(record.id, x, y)
+		//
+		// Measured end to end at 13:43:46: o_enemy 10 -> 11 and
+		// NUM_ENEMIES_ACTIVE 10 -> 11 on a "basic" with hp 100.
+		//
+		// The registry copy is the whole trick. dude_generate registers into
+		// global.DUDES; enemy_spawn looks its key up in global.ANIMALS. The
+		// record is already a complete fighting unit - 38 fields, identical in
+		// shape to an enemy's - so nothing about it needs building, only
+		// placing.
+		bool SpawnOneInjectedUnit(
+			const std::string& Type,
+			double X,
+			double Y,
+			const EnemyMarkers& Markers
+		)
+		{
+			if (!Markers.have_combatant_type)
+			{
+				LogWarn("no combatant_type value was read from the game, so "
+					"\"%s\" cannot be made hostile - not spawning it",
+					Type.c_str());
+				return false;
+			}
+
+			RValue record;
+			if (!bridge::CallScript("gml_Script_dude_generate",
 					{ RValue(Type) }, record))
 			{
-				LogWarn("animal_generate(\"%s\") could not be called",
+				LogWarn("dude_generate(\"%s\") could not be called",
 					Type.c_str());
 				return false;
 			}
@@ -2540,21 +2723,28 @@ namespace hmd::roster
 
 			if (!record_shaped || !record.m_Pointer)
 			{
-				LogWarn("animal_generate(\"%s\") did not return a record - the "
-					"type is probably not an enemy type name", Type.c_str());
+				LogWarn("dude_generate(\"%s\") did not return a record - the "
+					"peer may be naming a dude type this build does not have",
+					Type.c_str());
 				return false;
 			}
 
-			auto id = bridge::CallBuiltin("variable_struct_get",
-				{ record, RValue("id") });
+			const std::string key = RecordKey(record);
 
-			if (!id || id->m_Kind != VALUE_STRING || !id->ToCString())
+			if (key.empty())
 			{
 				LogWarn("the record for \"%s\" has no string .id", Type.c_str());
 				return false;
 			}
 
-			const std::string key = id->ToCString();
+			// Hostile, then findable.
+			bridge::CallBuiltin("variable_struct_set",
+				{ record, RValue("combatant_type"), Markers.combatant_type });
+
+			RegistrySet("ANIMALS", key, record);
+
+			if (Markers.have_conscious)
+				RegistrySet("ANIMALS_CONSCIOUS", key, Markers.conscious);
 
 			// The key must resolve to a record before the spawner is given it.
 			// Handing enemy_spawn a key with no ANIMALS entry aborts inside the
@@ -2564,16 +2754,20 @@ namespace hmd::roster
 
 			if (!registered.has_value() || !*registered)
 			{
-				LogWarn("the record for \"%s\" did not register itself as "
-					"\"%s\" - not spawning it", Type.c_str(), key.c_str());
+				LogWarn("the record for \"%s\" is not in ANIMALS as \"%s\" - "
+					"not spawning it", Type.c_str(), key.c_str());
+
+				ForgetGeneratedRecord(key);
 				return false;
 			}
 
 			RValue spawned;
 			if (!bridge::CallScript("gml_Script_enemy_spawn",
-					{ *id, RValue(X), RValue(Y) }, spawned))
+					{ RValue(key), RValue(X), RValue(Y) }, spawned))
 			{
 				LogWarn("enemy_spawn(\"%s\") could not be called", key.c_str());
+
+				ForgetGeneratedRecord(key);
 				return false;
 			}
 
@@ -3547,6 +3741,799 @@ namespace hmd::roster
 		}
 	}
 
+	namespace
+	{
+		// The field names of a struct, in the order the game reports them.
+		//
+		// struct_get_names / struct_get are the game's own API for opening a
+		// struct, and this is NOT the instance-member read that is impossible
+		// on this build. The records here are plain structs the game handed
+		// back from a generator; section 4's dead end does not apply to them.
+		// SpawnOneInjectedUnit already reads `.id` off one on every injection.
+		std::vector<std::string> StructFieldNames(const RValue& Record)
+		{
+			std::vector<std::string> fields;
+
+			const bool struct_shaped = Record.m_Kind == VALUE_OBJECT ||
+				Record.m_Kind == VALUE_REF;
+
+			if (!struct_shaped || !Record.m_Pointer)
+				return fields;
+
+			auto names = bridge::CallBuiltin("struct_get_names", { Record });
+			if (!names || names->m_Kind != VALUE_ARRAY)
+				return fields;
+
+			auto length = bridge::CallBuiltin("array_length", { *names });
+			if (!length || (length->m_Kind != VALUE_REAL &&
+				length->m_Kind != VALUE_INT32 && length->m_Kind != VALUE_INT64))
+				return fields;
+
+			const int count = static_cast<int>(length->ToDouble());
+
+			// Bounded: this goes into a file a person reads.
+			for (int i = 0; i < count && i < 64; i++)
+			{
+				auto name = bridge::CallBuiltin("array_get",
+					{ *names, RValue(static_cast<double>(i)) });
+
+				if (!name || name->m_Kind != VALUE_STRING || !name->ToCString())
+					continue;
+
+				fields.push_back(name->ToCString());
+			}
+
+			return fields;
+		}
+
+		// Dump every field of a record, with the values described rather than
+		// converted. DescribeValue never calls a runtime conversion, which is
+		// what makes it safe on a field whose kind is not known in advance.
+		void LogRecordFields(const char* Label, const RValue& Record)
+		{
+			const std::vector<std::string> fields = StructFieldNames(Record);
+
+			if (fields.empty())
+			{
+				SelfTestWarn("    %s: no fields could be read from it", Label);
+				return;
+			}
+
+			SelfTestLog("    %s: %zu field(s)", Label, fields.size());
+
+			for (const std::string& field : fields)
+			{
+				auto value = bridge::CallBuiltin("variable_struct_get",
+					{ Record, RValue(field) });
+
+				SelfTestLog("        .%s = %s", field.c_str(),
+					value ? DescribeValue(*value).c_str() : "unreadable");
+			}
+		}
+
+		// Read one named field, described. Empty when it is not there.
+		std::string DescribeField(const RValue& Record, const char* Field)
+		{
+			auto value = bridge::CallBuiltin("variable_struct_get",
+				{ Record, RValue(Field) });
+
+			return value ? DescribeValue(*value) : std::string{};
+		}
+
+		// RecordKey and ForgetGeneratedRecord are defined earlier, beside the
+		// registry helpers, because the injection path needs them too.
+
+		// Which of the candidate registries holds this key. Reported rather
+		// than reduced to a bool, because "unreadable" and "absent" are
+		// different answers and conflating them is how a probe ends up
+		// asserting more than it saw.
+		void ReportRegistryMembership(const char* Label, const std::string& Key)
+		{
+			if (Key.empty())
+			{
+				SelfTestWarn("    %s: no key to look up", Label);
+				return;
+			}
+
+			// ANIMALS and ANIMALS_CONSCIOUS are measured. The rest are the
+			// plausible names for a separate dude registry, and asking is free:
+			// GetGlobal on a global that does not exist returns nothing, with
+			// no call into game code and no side effect.
+			for (const char* registry : { "ANIMALS", "ANIMALS_CONSCIOUS",
+				"DUDES", "DUDES_CONSCIOUS", "COMBATANTS", "ROSTER" })
+			{
+				const auto present = RegistryHasKey(registry, Key);
+
+				// An unreadable global is almost always one that does not
+				// exist, and printing six of those per record would bury the
+				// two lines that matter.
+				if (!present)
+					continue;
+
+				SelfTestLog("        global.%s[\"%s\"] -> %s", registry,
+					Key.c_str(), *present ? "PRESENT" : "absent");
+			}
+		}
+
+		// A dude type name that is legal to generate.
+		//
+		// The export is the only honest source: its `dudes` map is the player's
+		// actual roster, named by the game itself, so every key in it is real by
+		// construction. There is deliberately no fallback to a guessed name -
+		// "basic" is a name this project has seen, not a name it can assume, and
+		// feeding a generator an invented string is how the enemy-namespace
+		// question cost four sessions.
+		std::string ResolveDudeType(std::string& SourceOut)
+		{
+			const std::string exported = CaptureGameNativeExport();
+
+			json::Value root;
+			if (!json::Parse(exported, root) || !root.IsObject())
+				return {};
+
+			const json::Value& dudes = root["dudes"];
+			if (!dudes.IsObject() || dudes.Members().empty())
+				return {};
+
+			SourceOut = "this round's export";
+			return dudes.Members().begin()->first;
+		}
+
+		// ------------------------------------------------------------------
+		// dudes/registry - can the opponent's ACTUAL dudes be spawned?
+		// ------------------------------------------------------------------
+		//
+		// The duel currently sends an army as a translation: each dude type is
+		// mapped round-robin onto a harvested enemy name, counts preserved,
+		// identities lost. The tester noticed within one round of the first
+		// real duel, which is the argument for doing better.
+		//
+		// It is a translation because `"enemies":{"basic":1}` aborts the
+		// runtime where `"enemies":{"toddler":1}` does not - dude names are
+		// illegal in the enemy map. But that is a fact about the MATCHUP
+		// FORMAT, and the matchup format is no longer how injection works.
+		// Injection is now two direct calls:
+		//
+		//     record = animal_generate(enemy_type)
+		//     enemy_spawn(record.id, x, y)
+		//
+		// and nothing has ever tested whether the first of those has a sibling.
+		// `dude_generate` (top_functions.txt:1310) and `dude_spawn` (:1334)
+		// exist and appear nowhere in this mod's source. Three things suggest
+		// dudes and enemies are one registry distinguished by a field rather
+		// than two separate systems:
+		//
+		//   1. the registry is called ANIMALS, generically, not ENEMIES;
+		//   2. its records carry `.combatant_type` - 1 for a toddler;
+		//   3. `combatant_type_inherit` exists as a top-level script.
+		//
+		// If that holds, the real duel is:
+		//
+		//     record = dude_generate("basic")      a real dude, with real stats
+		//     variable_struct_set(record, "combatant_type", <the enemy value>)
+		//     enemy_spawn(record.id, x, y)         spawned hostile
+		//
+		// This probe does not attempt that. It answers the three questions the
+		// attempt depends on, and it does so WITHOUT SPAWNING ANYTHING:
+		//
+		//   1. does dude_generate return a record at all, and survive?
+		//   2. does it register into global.ANIMALS, or somewhere else?
+		//   3. what does its combatant_type hold, against an enemy's?
+		//
+		// Order matters. The enemy record is taken FIRST, as the control,
+		// because animal_generate is measured safe and dude_generate has never
+		// been called. If the second call ends the process, the transcript
+		// still holds the first - and the journal line says which one it was.
+		//
+		// Classified Fatal for exactly that reason. It is one launch, and the
+		// honest classification of a routine nobody has ever called is the one
+		// that assumes the worst.
+		//
+		// ------------------------------------------------------------------
+		// IT HAS RUN. Every question above is ANSWERED - 13:29:34, round 1.
+		// ------------------------------------------------------------------
+		//
+		//   1. dude_generate("basic") SURVIVES and returns a record. The
+		//      routine was never the risk.
+		//
+		//   2. THE HYPOTHESIS ABOVE IS WRONG. It is NOT one registry:
+		//
+		//          enemy "r16"  ->  global.ANIMALS  + ANIMALS_CONSCIOUS
+		//          dude  "c2b"  ->  global.DUDES
+		//
+		//      `DUDES` was a guessed candidate name in ReportRegistryMembership
+		//      and it hit. Two registries, one generator shape.
+		//
+		//   3. combatant_type: enemy = 1, dude = 0. THE FIELD IS THE SWITCH.
+		//
+		// And the part that makes the whole route worth having: both records
+		// carry 38 fields with IDENTICAL NAMES, and the dude's are real -
+		// `.hp = 100` against the toddler's 18, `.radius = 60` against 40,
+		// its own `.sprite`, `.color`, `.visual_scale`, `.get_thrown_sound`.
+		// A dude record is a complete fighting unit, not a stub.
+		//
+		// So the translation is not the only option any more. The remaining
+		// step is registry placement rather than record content: enemy_spawn
+		// takes a key and looks it up in ANIMALS, and a dude's key is in DUDES.
+		// RunDudeAsEnemyProbe below tests exactly that and nothing else.
+		//
+		// This entry is kept, and is now cheap to re-run: its own crash was in
+		// the cleanup helper, which no longer calls animal_delete. See
+		// ForgetGeneratedRecord for why that call was fatal here and safe in
+		// the injection path.
+		Outcome RunDudeRegistryProbe(const Arm& Arm)
+		{
+			SelfTestLog("=== dude-registry probe: is a dude the same kind of "
+				"record as an enemy? ===");
+
+			if (!bridge::ScriptExists("gml_Script_animal_generate"))
+			{
+				SelfTestWarn("    animal_generate does not exist on this build, "
+					"so there is no control to compare against");
+				return Outcome::Skipped;
+			}
+
+			const bool has_dude_generate =
+				bridge::ScriptExists("gml_Script_dude_generate");
+
+			SelfTestLog("    dude_generate exists on this build: %s",
+				has_dude_generate ? "YES" : "NO");
+			SelfTestLog("    dude_spawn exists on this build:    %s",
+				bridge::ScriptExists("gml_Script_dude_spawn") ? "YES" : "NO");
+
+			if (!has_dude_generate)
+			{
+				SelfTestWarn("    without dude_generate the whole route is "
+					"closed and the translation is the only option");
+				return Outcome::Skipped;
+			}
+
+			// Both names resolved before anything is armed. Neither of these
+			// can kill the game: one reads the export, the other reads the
+			// export and a script measured safe across several sessions.
+			std::string dude_source;
+			const std::string dude_type = ResolveDudeType(dude_source);
+
+			std::string enemy_source;
+			const std::string enemy_type = ResolveInjectableType(enemy_source);
+
+			if (dude_type.empty())
+			{
+				SelfTestWarn("    no dude type could be read from the export. "
+					"This needs a round with at least one dude on the field - "
+					"press F5 during a fight rather than on the ranch");
+				return Outcome::Skipped;
+			}
+
+			if (enemy_type.empty())
+			{
+				SelfTestWarn("    no enemy type is available as a control");
+				return Outcome::Skipped;
+			}
+
+			SelfTestLog("    dude type  \"%s\" (from %s)", dude_type.c_str(),
+				dude_source.c_str());
+			SelfTestLog("    enemy type \"%s\" (from %s)", enemy_type.c_str(),
+				enemy_source.c_str());
+
+			// Nothing here spawns, so neither counter should move. Measured
+			// anyway: "does generating alone count as an enemy" is a free
+			// question and the answer changes how the real path must clean up.
+			const int enemies_before = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
+			const int dudes_before = ReadGlobalCount("NUM_DUDES_ACTIVE");
+
+			SelfTestLog("    before: NUM_ENEMIES_ACTIVE %d, NUM_DUDES_ACTIVE %d",
+				enemies_before, dudes_before);
+
+			// ---------------------------------------------------------------
+			// 1. The control: an enemy record, from the call injection uses.
+			// ---------------------------------------------------------------
+			Arm();
+
+			RValue enemy_record;
+			const bool enemy_ok = bridge::CallScriptAnnounced(
+				"gml_Script_animal_generate", { RValue(enemy_type) },
+				enemy_record);
+
+			std::string enemy_key;
+
+			if (!enemy_ok)
+			{
+				SelfTestWarn("    [1] animal_generate(\"%s\") could not be "
+					"called - no control this press", enemy_type.c_str());
+			}
+			else
+			{
+				SelfTestLog("    [1] animal_generate(\"%s\") -> %s",
+					enemy_type.c_str(), DescribeValue(enemy_record).c_str());
+
+				enemy_key = RecordKey(enemy_record);
+
+				LogRecordFields("[1] the ENEMY record", enemy_record);
+				ReportRegistryMembership("[1] the enemy key", enemy_key);
+			}
+
+			// ---------------------------------------------------------------
+			// 2. The question: the same call, on a dude type.
+			// ---------------------------------------------------------------
+			SelfTestLog("    [2] calling dude_generate(\"%s\") - THIS HAS NEVER "
+				"BEEN CALLED. If the transcript stops here, that is the answer "
+				"and the journal has already recorded it.", dude_type.c_str());
+
+			RValue dude_record;
+			const bool dude_ok = bridge::CallScriptAnnounced(
+				"gml_Script_dude_generate", { RValue(dude_type) }, dude_record);
+
+			std::string dude_key;
+
+			if (!dude_ok)
+			{
+				SelfTestWarn("    [2] dude_generate(\"%s\") could not be called "
+					"at all. It resolves but the call did not go through, which "
+					"is a different failure from the game dying - the argument "
+					"shape is the next suspect", dude_type.c_str());
+			}
+			else
+			{
+				SelfTestLog("    [2] SURVIVED. dude_generate(\"%s\") -> %s",
+					dude_type.c_str(), DescribeValue(dude_record).c_str());
+
+				dude_key = RecordKey(dude_record);
+
+				LogRecordFields("[2] the DUDE record", dude_record);
+				ReportRegistryMembership("[2] the dude key", dude_key);
+			}
+
+			// ---------------------------------------------------------------
+			// 3. The comparison, which is the whole point.
+			// ---------------------------------------------------------------
+			if (enemy_ok && dude_ok)
+			{
+				const std::vector<std::string> enemy_fields =
+					StructFieldNames(enemy_record);
+				const std::vector<std::string> dude_fields =
+					StructFieldNames(dude_record);
+
+				auto has = [](const std::vector<std::string>& In,
+					const std::string& Name)
+				{
+					return std::find(In.begin(), In.end(), Name) != In.end();
+				};
+
+				std::vector<std::string> enemy_only;
+				std::vector<std::string> dude_only;
+
+				for (const std::string& field : enemy_fields)
+					if (!has(dude_fields, field))
+						enemy_only.push_back(field);
+
+				for (const std::string& field : dude_fields)
+					if (!has(enemy_fields, field))
+						dude_only.push_back(field);
+
+				SelfTestLog("    [3] enemy record %zu field(s), dude record "
+					"%zu field(s)", enemy_fields.size(), dude_fields.size());
+
+				if (enemy_only.empty() && dude_only.empty())
+				{
+					SelfTestLog("    [3] THE TWO RECORDS HAVE THE SAME SHAPE. "
+						"One record type, one registry - which is what the "
+						"combatant_type route needs.");
+				}
+				else
+				{
+					for (const std::string& field : enemy_only)
+						SelfTestLog("    [3] only the ENEMY has .%s",
+							field.c_str());
+
+					for (const std::string& field : dude_only)
+						SelfTestLog("    [3] only the DUDE has .%s",
+							field.c_str());
+				}
+
+				// The field the whole route turns on.
+				const std::string enemy_ct =
+					DescribeField(enemy_record, "combatant_type");
+				const std::string dude_ct =
+					DescribeField(dude_record, "combatant_type");
+
+				SelfTestLog("    [3] combatant_type: enemy = %s, dude = %s",
+					enemy_ct.empty() ? "ABSENT" : enemy_ct.c_str(),
+					dude_ct.empty() ? "ABSENT" : dude_ct.c_str());
+
+				if (!enemy_ct.empty() && !dude_ct.empty() && enemy_ct != dude_ct)
+				{
+					SelfTestLog("    [3] THEY DIFFER. That is the field, and "
+						"those are the two values. The next step is a probe "
+						"that writes the enemy value onto a dude record and "
+						"hands the key to enemy_spawn.");
+				}
+				else if (!enemy_ct.empty() && enemy_ct == dude_ct)
+				{
+					SelfTestWarn("    [3] they are EQUAL, so combatant_type is "
+						"not what separates a dude from an enemy and the "
+						"difference is elsewhere. Compare the dumps above "
+						"field by field before trying anything.");
+				}
+			}
+
+			// ---------------------------------------------------------------
+			// 4. Put the registries back.
+			// ---------------------------------------------------------------
+			ForgetGeneratedRecord(enemy_key);
+			ForgetGeneratedRecord(dude_key);
+
+			const int enemies_after = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
+			const int dudes_after = ReadGlobalCount("NUM_DUDES_ACTIVE");
+
+			SelfTestLog("    [4] cleaned up. NUM_ENEMIES_ACTIVE %d -> %d, "
+				"NUM_DUDES_ACTIVE %d -> %d", enemies_before, enemies_after,
+				dudes_before, dudes_after);
+
+			// Generating without spawning should move nothing. If it does, the
+			// real path has a cleanup obligation it does not currently have,
+			// and that is worth shouting about rather than leaving in a diff of
+			// four numbers.
+			if (enemies_after != enemies_before || dudes_after != dudes_before)
+			{
+				SelfTestWarn("    [4] A COUNTER MOVED and nothing was spawned. "
+					"Generating a record is not free on this build. Whatever "
+					"builds on this must put the counter back the way "
+					"ClearDefaultEnemyWave now does.");
+			}
+
+			if (!enemy_key.empty())
+			{
+				SelfTestLog("    [4] enemy key \"%s\" after cleanup:",
+					enemy_key.c_str());
+				ReportRegistryMembership("[4] enemy key", enemy_key);
+			}
+
+			if (!dude_key.empty())
+			{
+				SelfTestLog("    [4] dude key \"%s\" after cleanup:",
+					dude_key.c_str());
+				ReportRegistryMembership("[4] dude key", dude_key);
+			}
+
+			return Outcome::Answered;
+		}
+	}
+
+	namespace
+	{
+		// ------------------------------------------------------------------
+		// dudes/as-enemy - spawn a real dude as a hostile
+		// ------------------------------------------------------------------
+		//
+		// Everything this needs was measured by RunDudeRegistryProbe:
+		//
+		//     dude_generate("basic") -> record, 38 fields, real stats
+		//     the record lands in global.DUDES, not global.ANIMALS
+		//     combatant_type is 0 on a dude and 1 on an enemy
+		//
+		// `enemy_spawn(key, x, y)` takes a KEY and looks it up in ANIMALS. The
+		// dude's key is in DUDES. That is the entire remaining gap, and it is a
+		// placement problem rather than a content problem - the record itself
+		// is already a complete fighting unit.
+		//
+		// So:
+		//
+		//   1. generate a dude record
+		//   2. set its combatant_type to the value an ENEMY record carries
+		//   3. copy it into global.ANIMALS under its own key, and set the
+		//      alive flag in ANIMALS_CONSCIOUS
+		//   4. enemy_spawn(key, x, y)
+		//
+		// Neither of the two values written is invented. combatant_type is read
+		// off a live enemy record generated moments earlier, and the conscious
+		// flag is a copy of one the game itself wrote - RValue(1) would be a
+		// VALUE_INT64 where the game may store a VALUE_BOOL, and this project
+		// has already paid for guessing a kind once. RegistryAnyValue exists
+		// for precisely this.
+		//
+		// THIS SPAWNS. It sits behind allow_spawn_probes with the other two,
+		// and it is Fatal: enemy_spawn on a record the game did not build is
+		// the untested half, and a half-built combatant is what stops a round
+		// resolving.
+		//
+		// The measurement that matters is NOT survival. It is:
+		//
+		//     o_enemy instances    N -> N+1     the unit exists
+		//     NUM_ENEMIES_ACTIVE   N -> N+1     the wave counts it
+		//
+		// Both, or it did nothing useful. Eight SURVIVED lines that moved no
+		// counter is the mistake this codebase keeps a lesson about.
+		Outcome RunDudeAsEnemyProbe(const Arm& Arm)
+		{
+			SelfTestLog("=== dude-as-enemy probe: can the opponent's REAL army "
+				"be spawned? ===");
+
+			for (const char* script : { "gml_Script_dude_generate",
+				"gml_Script_animal_generate", "gml_Script_enemy_spawn" })
+			{
+				if (!bridge::ScriptExists(script))
+				{
+					SelfTestWarn("    %s does not exist on this build", script);
+					return Outcome::Skipped;
+				}
+			}
+
+			std::string dude_source;
+			const std::string dude_type = ResolveDudeType(dude_source);
+
+			if (dude_type.empty())
+			{
+				SelfTestWarn("    no dude type could be read from the export - "
+					"press F5 during a fight");
+				return Outcome::Skipped;
+			}
+
+			std::string enemy_source;
+			const std::string enemy_type = ResolveInjectableType(enemy_source);
+
+			if (enemy_type.empty())
+			{
+				SelfTestWarn("    no enemy type is available to read a "
+					"combatant_type from");
+				return Outcome::Skipped;
+			}
+
+			double x = 0.0;
+			double y = 0.0;
+			std::string position_source;
+			ResolveInjectionPosition(x, y, position_source);
+
+			SelfTestLog("    dude \"%s\" (from %s), enemy control \"%s\" "
+				"(from %s), position %.1f,%.1f (from %s)",
+				dude_type.c_str(), dude_source.c_str(), enemy_type.c_str(),
+				enemy_source.c_str(), x, y, position_source.c_str());
+
+			const int instances_before = CountEnemyInstances();
+			const int enemies_before = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
+			const int dudes_before = ReadGlobalCount("NUM_DUDES_ACTIVE");
+
+			SelfTestLog("    before: o_enemy %d, NUM_ENEMIES_ACTIVE %d, "
+				"NUM_DUDES_ACTIVE %d", instances_before, enemies_before,
+				dudes_before);
+
+			Arm();
+
+			// ---------------------------------------------------------------
+			// 1. The enemy control, purely to read its combatant_type.
+			// ---------------------------------------------------------------
+			RValue enemy_record;
+			if (!bridge::CallScript("gml_Script_animal_generate",
+					{ RValue(enemy_type) }, enemy_record))
+			{
+				SelfTestWarn("    [1] animal_generate(\"%s\") could not be "
+					"called - no combatant_type to copy", enemy_type.c_str());
+				return Outcome::Skipped;
+			}
+
+			const std::string enemy_key = RecordKey(enemy_record);
+
+			auto enemy_combatant_type = bridge::CallBuiltin(
+				"variable_struct_get",
+				{ enemy_record, RValue("combatant_type") });
+
+			if (!enemy_combatant_type ||
+				enemy_combatant_type->m_Kind == VALUE_UNDEFINED)
+			{
+				SelfTestWarn("    [1] the enemy record has no combatant_type to "
+					"copy - the previous probe's finding does not reproduce");
+				ForgetGeneratedRecord(enemy_key);
+				return Outcome::Skipped;
+			}
+
+			SelfTestLog("    [1] enemy \"%s\" -> key \"%s\", combatant_type %s",
+				enemy_type.c_str(), enemy_key.c_str(),
+				DescribeValue(*enemy_combatant_type).c_str());
+
+			// The alive flag, copied from whatever the game already wrote
+			// rather than constructed here. Taken while a real enemy key is
+			// definitely in the registry.
+			auto conscious_value = RegistryAnyValue("ANIMALS_CONSCIOUS");
+
+			// ---------------------------------------------------------------
+			// 2. The dude record.
+			// ---------------------------------------------------------------
+			RValue dude_record;
+			if (!bridge::CallScript("gml_Script_dude_generate",
+					{ RValue(dude_type) }, dude_record))
+			{
+				SelfTestWarn("    [2] dude_generate(\"%s\") could not be called",
+					dude_type.c_str());
+				ForgetGeneratedRecord(enemy_key);
+				return Outcome::Skipped;
+			}
+
+			const std::string dude_key = RecordKey(dude_record);
+
+			if (dude_key.empty())
+			{
+				SelfTestWarn("    [2] the dude record has no string .id");
+				ForgetGeneratedRecord(enemy_key);
+				return Outcome::Skipped;
+			}
+
+			SelfTestLog("    [2] dude \"%s\" -> key \"%s\", hp %s",
+				dude_type.c_str(), dude_key.c_str(),
+				DescribeField(dude_record, "hp").c_str());
+
+			// ---------------------------------------------------------------
+			// 3. Make it an enemy: the field, then the registry.
+			// ---------------------------------------------------------------
+			const bool type_written = bridge::CallBuiltin("variable_struct_set",
+				{ dude_record, RValue("combatant_type"),
+				  *enemy_combatant_type }).has_value();
+
+			SelfTestLog("    [3] combatant_type written onto the dude record: "
+				"%s -> now %s", type_written ? "ok" : "FAILED",
+				DescribeField(dude_record, "combatant_type").c_str());
+
+			const bool registered = RegistrySet("ANIMALS", dude_key, dude_record);
+
+			bool conscious_written = false;
+			if (conscious_value)
+			{
+				conscious_written = RegistrySet("ANIMALS_CONSCIOUS", dude_key,
+					*conscious_value);
+			}
+			else
+			{
+				SelfTestWarn("    [3] no existing ANIMALS_CONSCIOUS value to "
+					"copy, so the alive flag is not being set. If the spawn "
+					"produces a unit that does not act, this is why");
+			}
+
+			SelfTestLog("    [3] global.ANIMALS[\"%s\"] written: %s. "
+				"ANIMALS_CONSCIOUS written: %s", dude_key.c_str(),
+				registered ? "ok" : "FAILED",
+				conscious_written ? "ok" : "no");
+
+			// The precondition the injection path enforces on every spawn. A
+			// key with no ANIMALS record aborts inside o_combatant's Create
+			// event and leaves a half-built unit that stops the round
+			// resolving - that cost a live run once already.
+			const auto present = RegistryHasKey("ANIMALS", dude_key);
+
+			if (!present.has_value() || !*present)
+			{
+				SelfTestWarn("    [3] the dude key is NOT in ANIMALS after "
+					"writing it, so enemy_spawn is not being called. That is "
+					"the guard that protects the round, not a probe failure");
+
+				ForgetGeneratedRecord(enemy_key);
+				ForgetGeneratedRecord(dude_key);
+				return Outcome::Answered;
+			}
+
+			// ---------------------------------------------------------------
+			// 4. Spawn it.
+			// ---------------------------------------------------------------
+			SelfTestLog("    [4] calling enemy_spawn(\"%s\", %.1f, %.1f) on a "
+				"DUDE record. This has never been done.", dude_key.c_str(),
+				x, y);
+
+			RValue spawned;
+			const bool spawn_ok = bridge::CallScript("gml_Script_enemy_spawn",
+				{ RValue(dude_key), RValue(x), RValue(y) }, spawned);
+
+			const int instances_after = CountEnemyInstances();
+			const int enemies_after = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
+			const int dudes_after = ReadGlobalCount("NUM_DUDES_ACTIVE");
+
+			SelfTestLog("    [4] SURVIVED. enemy_spawn returned %s",
+				spawn_ok ? DescribeValue(spawned).c_str() : "nothing");
+
+			SelfTestLog("    [4] o_enemy instances    %d -> %d",
+				instances_before, instances_after);
+			SelfTestLog("    [4] NUM_ENEMIES_ACTIVE   %d -> %d",
+				enemies_before, enemies_after);
+			SelfTestLog("    [4] NUM_DUDES_ACTIVE     %d -> %d",
+				dudes_before, dudes_after);
+
+			// The verdict, stated rather than left in four numbers.
+			const bool exists = instances_after > instances_before;
+			const bool counted = enemies_after > enemies_before;
+
+			if (exists && counted)
+			{
+				SelfTestLog("    [5] IT WORKED. A dude record spawned as a "
+					"counted enemy. The duel can send the opponent's REAL "
+					"army and the translation can be deleted.");
+			}
+
+			// Measured on the first run: NUM_DUDES_ACTIVE 1 -> 2 alongside
+			// NUM_ENEMIES_ACTIVE 10 -> 11. The unit counts as BOTH, which is
+			// wrong for a duel in a way that is not cosmetic - an opponent's
+			// army inflating your own roster count is what the round-end and
+			// scoreboard code both read.
+			//
+			// Reported separately from the verdict because it does not make the
+			// spawn a failure. It makes it a spawn with an obligation.
+			if (dudes_after > dudes_before)
+			{
+				SelfTestWarn("    [5] AND NUM_DUDES_ACTIVE WENT UP TOO (%d -> "
+					"%d). The unit counts as an enemy AND as one of your dudes. "
+					"Whatever uses this route must put that counter back on "
+					"every spawn, or the victory screen reads a roster that "
+					"does not exist.", dudes_before, dudes_after);
+			}
+			else if (exists)
+			{
+				SelfTestWarn("    [5] the unit exists and the wave does NOT "
+					"count it. Same shape as the old matchup dead end - it is "
+					"on the field but the round will not wait for it");
+			}
+			else if (counted)
+			{
+				SelfTestWarn("    [5] the counter moved and no instance "
+					"appeared. That is a leaked count, which is worse than "
+					"nothing - the cleanup below has to put it back");
+			}
+			else
+			{
+				SelfTestWarn("    [5] nothing happened. enemy_spawn will not "
+					"build from a dude record even placed in ANIMALS, so the "
+					"difference is inside the record rather than around it");
+			}
+
+			// ---------------------------------------------------------------
+			// 5. Put the round back.
+			// ---------------------------------------------------------------
+			if (g_InjectionPersist.load())
+			{
+				SelfTestWarn("    [6] injection_persist is on - the unit is "
+					"being LEFT STANDING. Play the round out and report "
+					"whether it ends. Turn this off afterwards.");
+
+				return Outcome::Answered;
+			}
+
+			if (exists && spawned.m_Kind != VALUE_UNDEFINED)
+				bridge::CallBuiltin("instance_destroy", { spawned });
+
+			ForgetGeneratedRecord(enemy_key);
+			ForgetGeneratedRecord(dude_key);
+
+			const int instances_cleaned = CountEnemyInstances();
+			const int enemies_cleaned = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
+
+			SelfTestLog("    [6] cleaned up: o_enemy %d, NUM_ENEMIES_ACTIVE %d",
+				instances_cleaned, enemies_cleaned);
+
+			// instance_destroy does not decrement the counter - the same fact
+			// that froze the first real duel. Put it back by hand, exactly as
+			// ClearDefaultEnemyWave and RemoveInjectedWave now do.
+			//
+			// BOTH counters, and the second one is not symmetry for its own
+			// sake. The first run of this probe measured:
+			//
+			//     NUM_ENEMIES_ACTIVE   10 -> 11
+			//     NUM_DUDES_ACTIVE      1 ->  2
+			//
+			// A dude record spawned through enemy_spawn counts as BOTH. Only
+			// the enemy counter was restored, the DUDES record was removed, and
+			// eight seconds later the round ended into:
+			//
+			//     I32 argument is undefined
+			//     gml_Script_scoreboard_data_set:37
+			//     gml_Script_victory_ui_spawn:9
+			//
+			// The scoreboard walked a roster that still counted two dudes and
+			// found a record for only one. Removing the entry while leaving the
+			// count is the same bug as leaving the count while removing the
+			// instance - it just fails at the victory screen instead of never
+			// reaching one.
+			RestoreCountIfMoved("NUM_ENEMIES_ACTIVE", enemies_before);
+			RestoreCountIfMoved("NUM_DUDES_ACTIVE", dudes_before);
+
+			return Outcome::Answered;
+		}
+	}
+
 	// Wrap a probe that takes nothing and cannot decline. Most of the read-only
 	// probes are shaped like that; the manifest is not a reason to change them.
 	//
@@ -3692,6 +4679,42 @@ namespace hmd::roster
 		//
 		// The open question goes FIRST.
 		//
+		// Right now that is dudes/as-enemy. dudes/registry below it has run and
+		// answered: dude_generate survives, dudes live in global.DUDES rather
+		// than ANIMALS, and combatant_type is 0 on a dude against 1 on an
+		// enemy. What is left is whether enemy_spawn will build from a dude
+		// record placed in ANIMALS - which is the last thing standing between
+		// the duel and sending the opponent's real army.
+		//
+		// It spawns, so it is gated with the other two spawning probes.
+		if (g_AllowSpawnProbes.load())
+		{
+			manifest.push_back({
+				"dudes/as-enemy",
+				"can a dude record be spawned as a counted enemy?",
+				Lethality::Fatal,
+				[](const Arm& arm) { return RunDudeAsEnemyProbe(arm); }
+			});
+		}
+		else
+		{
+			SelfTestLog("--- dudes/as-enemy is THE OPEN QUESTION and is NOT "
+				"running: it spawns, so it needs allow_spawn_probes = true in "
+				"the ini. Set it, press F5 in a fight, then set it back. "
+				"Expect the round to be disturbed ---");
+		}
+
+		// Answered at 13:29:34 on round 1, and kept because re-running it is
+		// now cheap - its only failure was a cleanup call that has been
+		// removed. It costs nothing to confirm the registry split on a build
+		// where that matters.
+		manifest.push_back({
+			"dudes/registry",
+			"is a dude the same kind of record as an enemy?",
+			Lethality::Fatal,
+			[](const Arm& arm) { return RunDudeRegistryProbe(arm); }
+		});
+
 		// Everything else in this group is answered: nine payload stages that
 		// survive and move nothing, four apply candidates that do the same. Put
 		// ahead of the injection probe they cost a press and risk a round -
@@ -3937,6 +4960,28 @@ namespace hmd::roster
 		g_SuppressDefaultWave.store(Suppressed);
 	}
 
+	// Clear the round's own wave so the opponent's army is what is fought.
+	//
+	// The destroy loop is the easy half. The counter is the other half, and
+	// getting it wrong is what froze the first real duel:
+	//
+	//     13:03:27  cleared 13 default enemy instance(s)
+	//     13:03:30  spawned 2 unit(s); NUM_ENEMIES_ACTIVE is now 15
+	//     13:04:05  NUM_ENEMIES_ACTIVE = 13, o_enemy instances = 0
+	//
+	// `instance_destroy` does NOT decrement NUM_ENEMIES_ACTIVE - the game does
+	// that on its own death path, which destroying an instance walks straight
+	// past. This is the same fact RemoveInjectedWave was written around; it was
+	// simply never applied here, so the whole default wave leaked its count and
+	// the round was left waiting on 13 enemies that no longer existed.
+	//
+	// The two injected units then died in combat and the game took the counter
+	// 15 -> 13 by itself, which is the useful half of that log: the death path
+	// DOES account for an injected unit. Only the destroy path does not.
+	//
+	// So the correction is arithmetic and is applied here rather than being
+	// left for InjectOpponentArmy to inherit - g_EnemiesBeforeInjection is read
+	// straight after this returns, and it needs to see the truth.
 	void ClearDefaultEnemyWave()
 	{
 		SetDefaultWaveSuppressed(true);
@@ -3948,6 +4993,8 @@ namespace hmd::roster
 			return;
 		}
 
+		const int before = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
+
 		int destroyed = 0;
 		for (const RValue& enemy : enemies)
 		{
@@ -3958,6 +5005,45 @@ namespace hmd::roster
 		g_EnemiesCleared.fetch_add(destroyed);
 
 		LogStage(kStageInject, "cleared %d default enemy instance(s)", destroyed);
+
+		// -1 means the global could not be read at all, in which case there is
+		// nothing trustworthy to correct towards and guessing would be worse
+		// than leaving it.
+		if (before < 0)
+		{
+			LogWarn("NUM_ENEMIES_ACTIVE could not be read before clearing, so it "
+				"cannot be corrected afterwards. If this round refuses to end, "
+				"that is why.");
+			return;
+		}
+
+		const int after = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
+		const int wanted = (std::max)(before - destroyed, 0);
+
+		if (after == wanted)
+		{
+			// Would mean the runtime started decrementing on destroy. Worth
+			// knowing, and worth not overwriting.
+			LogInfo("NUM_ENEMIES_ACTIVE came down to %d on its own after the "
+				"clear - instance_destroy is accounting for itself on this "
+				"build, and the correction below was not needed", after);
+			return;
+		}
+
+		LogWarn("clearing the default wave left NUM_ENEMIES_ACTIVE at %d for %d "
+			"destroyed instance(s) - correcting it to %d so this round can "
+			"still end", after, destroyed, wanted);
+
+		RestoreGlobalCount("NUM_ENEMIES_ACTIVE", wanted);
+
+		const int corrected = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
+
+		if (corrected != wanted)
+		{
+			LogError("NUM_ENEMIES_ACTIVE IS %d AND SHOULD BE %d after clearing "
+				"the default wave. This round will not finish when its last "
+				"enemy dies - restart the run.", corrected, wanted);
+		}
 	}
 
 	int EnemiesCleared()
@@ -4016,25 +5102,58 @@ namespace hmd::roster
 			return 0;
 		}
 
-		const json::Value& enemies = root["enemies"];
-		if (!enemies.IsObject() || enemies.Members().empty())
+		// THE ARMY IS THE `dudes` MAP NOW, not `enemies`.
+		//
+		// BuildDuelPayload sends the sender's roster verbatim and empties
+		// `enemies`, because a dude record spawns as a counted enemy on this
+		// build and no translation is needed. See SpawnOneInjectedUnit.
+		const json::Value& army = root["dudes"];
+
+		if (!army.IsObject() || army.Members().empty())
 		{
-			LogError("the peer's payload names no enemies - nothing to spawn");
+			// A peer on the previous build sends its army the other way round:
+			// `dudes` emptied and `enemies` carrying translated type names.
+			// Naming that explicitly beats "nothing to spawn", because the fix
+			// is a DLL copy rather than anything either player can do in game.
+			if (root["enemies"].IsObject() && !root["enemies"].Members().empty())
+			{
+				LogError("the peer's payload carries its army in 'enemies', "
+					"which is the PREVIOUS build's format. Both machines must "
+					"run the same DLL - nothing spawned this round.");
+			}
+			else
+			{
+				LogError("the peer's payload names no army - nothing to spawn");
+			}
+
 			return 0;
 		}
 
-		// The value removal has to get back to. Taken after
-		// ClearDefaultEnemyWave has run, so it is the count of whatever the
+		// Read once, before anything is generated, and reused for every unit.
+		// Each call to this generates a throwaway enemy record, so doing it per
+		// unit would be a registry churn for two values that do not vary.
+		const EnemyMarkers markers = ReadEnemyMarkers();
+
+		if (!markers.have_combatant_type)
+		{
+			LogError("the value that makes a unit hostile could not be read "
+				"from the game - the opponent's army cannot be spawned");
+			return 0;
+		}
+
+		// The values removal has to get back to. Taken after
+		// ClearDefaultEnemyWave has run, so they are the counts of whatever the
 		// round legitimately still holds.
 		g_Injected.clear();
 		g_EnemiesBeforeInjection = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
+		g_DudesBeforeInjection = ReadGlobalCount("NUM_DUDES_ACTIVE");
 
 		const std::vector<SpawnPosition> positions = InjectionPositions();
 
 		int spawned = 0;
 		size_t position = 0;
 
-		for (const auto& [type, count] : enemies.Members())
+		for (const auto& [type, count] : army.Members())
 		{
 			const double raw = count.AsNumber();
 			if (!std::isfinite(raw) || raw <= 0.0)
@@ -4052,14 +5171,54 @@ namespace hmd::roster
 				const SpawnPosition where = positions[position % positions.size()];
 				position++;
 
-				if (SpawnOneInjectedUnit(type, where.x, where.y))
+				if (SpawnOneInjectedUnit(type, where.x, where.y, markers))
 					spawned++;
 			}
 		}
 
-		LogStage(kStageInject, "spawned %d unit(s) as the opponent wave; "
-			"NUM_ENEMIES_ACTIVE is now %d", spawned,
-			ReadGlobalCount("NUM_ENEMIES_ACTIVE"));
+		// The opponent's army must count as enemies and NOT as our dudes.
+		//
+		// enemy_spawn on a dude record increments both counters - measured
+		// 13:43:46, NUM_ENEMIES_ACTIVE 10 -> 11 beside NUM_DUDES_ACTIVE 1 -> 2.
+		// The enemy count is what makes the round wait for the unit and is
+		// wanted. The dude count is not: it is the local player's roster, the
+		// victory screen reads it, and leaving it inflated ends the round in
+		//
+		//     I32 argument is undefined
+		//     gml_Script_scoreboard_data_set:37
+		//     gml_Script_victory_ui_spawn:9
+		//
+		// Put back to what it was before injection rather than decremented by
+		// the spawn count: the measured before-value is exact where arithmetic
+		// on a counter something else may have touched is not.
+		if (g_DudesBeforeInjection >= 0)
+		{
+			const int dudes_now = ReadGlobalCount("NUM_DUDES_ACTIVE");
+
+			if (dudes_now != g_DudesBeforeInjection)
+			{
+				LogInfo("the opponent's army raised NUM_DUDES_ACTIVE to %d - "
+					"putting it back to %d so it counts as their army rather "
+					"than our roster", dudes_now, g_DudesBeforeInjection);
+
+				RestoreGlobalCount("NUM_DUDES_ACTIVE", g_DudesBeforeInjection);
+
+				const int settled = ReadGlobalCount("NUM_DUDES_ACTIVE");
+
+				if (settled != g_DudesBeforeInjection)
+				{
+					LogError("NUM_DUDES_ACTIVE IS %d AND SHOULD BE %d. This "
+						"round will abort at the victory screen - restart the "
+						"run.", settled, g_DudesBeforeInjection);
+				}
+			}
+		}
+
+		LogStage(kStageInject, "spawned %d unit(s) as the opponent wave - their "
+			"REAL army, not a translation; NUM_ENEMIES_ACTIVE is now %d, "
+			"NUM_DUDES_ACTIVE %d", spawned,
+			ReadGlobalCount("NUM_ENEMIES_ACTIVE"),
+			ReadGlobalCount("NUM_DUDES_ACTIVE"));
 
 		if (spawned == 0)
 			LogError("not one unit of the opponent's army could be spawned");
@@ -4176,7 +5335,38 @@ namespace hmd::roster
 			}
 		}
 
+		// The dude counter, for the same reason and with the same care.
+		//
+		// InjectOpponentArmy already put this back once, straight after
+		// spawning. It is checked again here because the units have since been
+		// destroyed and their records removed, and the destroy path is not
+		// known to leave it alone - every other counter on this build has
+		// turned out to move when something adjacent to it was touched.
+		if (g_DudesBeforeInjection >= 0)
+		{
+			const int dudes_now = ReadGlobalCount("NUM_DUDES_ACTIVE");
+
+			if (dudes_now != g_DudesBeforeInjection)
+			{
+				LogWarn("the dude counter is %d and should be %d after removing "
+					"the wave - restoring it so the victory screen can read the "
+					"roster", dudes_now, g_DudesBeforeInjection);
+
+				RestoreGlobalCount("NUM_DUDES_ACTIVE", g_DudesBeforeInjection);
+
+				const int settled = ReadGlobalCount("NUM_DUDES_ACTIVE");
+
+				if (settled != g_DudesBeforeInjection)
+				{
+					LogError("NUM_DUDES_ACTIVE IS %d AND SHOULD BE %d. This "
+						"round will abort at the victory screen - restart the "
+						"run.", settled, g_DudesBeforeInjection);
+				}
+			}
+		}
+
 		g_EnemiesBeforeInjection = -1;
+		g_DudesBeforeInjection = -1;
 		return removed;
 	}
 }

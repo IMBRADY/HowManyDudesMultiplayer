@@ -337,6 +337,27 @@ namespace
 		Check(!IsMatchupPayload("[1,2,3]"), "a JSON array is rejected");
 		Check(!IsMatchupPayload(std::string(hmd::sanitize::kMaxMatchupBytes + 1, 'x')),
 			"an oversized payload is rejected on length alone");
+
+		// The duel payload changed shape when injection stopped translating
+		// dude types into enemy names: the army now travels in `dudes` and
+		// `enemies` is emptied. That gate is what every peer payload passes
+		// through before the mod will read it, so emptying a key it counts is
+		// exactly the kind of change that breaks the duel silently at the
+		// receiver - it would look like "the peer sent nothing".
+		//
+		// This is the real BuildDuelPayload output, taken verbatim from a
+		// one-dude export.
+		const std::string duel =
+			R"({"difficulty_score":0.0,"non_boss_enemies":{},"relic_order":[],)"
+			R"("dudes":{"basic":1.0},"roster_order":["basic"],)"
+			R"("arena_modifiers":[],"boss_fight_id":"","cash":100.0,)"
+			R"("trinket_dude_types":{},"tier":1.0,"relics":{},)"
+			R"("estimated_dude_count":0.0,"food":{},"estimated_relic_count":0.0,)"
+			R"("estimated_round":0.0,"food_ids":[],"consumables":{},)"
+			R"("dude_type_trinkets":{},"enemies":{}})";
+
+		Check(IsMatchupPayload(duel),
+			"the duel payload still validates with 'enemies' emptied");
 	}
 
 	void TestNetLoopback()
