@@ -67,7 +67,7 @@ if not exist "build" mkdir "build"
 
 del /q build\*.obj >nul 2>&1
 
-set "SOURCES=src\ModuleMain.cpp src\GameBridge.cpp src\GameHooks.cpp src\Json.cpp src\Sanitize.cpp src\Roster.cpp src\Net.cpp src\Steam.cpp src\RunState.cpp src\Ui.cpp src\Probe.cpp src\Match.cpp include\YYToolkit\YYTK_Shared_Types.cpp"
+set "SOURCES=src\ModuleMain.cpp src\GameBridge.cpp src\GameHooks.cpp src\Json.cpp src\Sanitize.cpp src\Roster.cpp src\Net.cpp src\Steam.cpp src\RunState.cpp src\Ui.cpp src\Probe.cpp src\ProbeJournal.cpp src\Match.cpp include\YYToolkit\YYTK_Shared_Types.cpp"
 
 REM /d1trimfile strips this directory from every __FILE__ the compiler bakes in.
 REM MSVC records headers by absolute path, so without it the build machine's

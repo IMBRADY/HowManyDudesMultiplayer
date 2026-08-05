@@ -97,6 +97,25 @@ namespace hmd::roster
 	// marker and runs the whole sequence again.
 	void SelfTestDuelPayload(bool RestartFromFirstStage);
 
+	// Leave a successful injection standing instead of destroying it.
+	//
+	// Off by default and meant to stay off. The injection probe's success
+	// signal is NUM_ENEMIES_ACTIVE going up, and that is a proxy: what a duel
+	// actually needs is for the round to refuse to end while the injected unit
+	// lives, which cannot be observed on a unit the probe deletes immediately
+	// after creating it. Turning this on spends one run measuring that, and
+	// leaves a real extra enemy in the round to do it.
+	void SetInjectionPersist(bool Persist);
+
+	// Allow the two probes that put a unit into the live round to run.
+	//
+	// Off by default. Both questions are settled - animal_generate +
+	// enemy_spawn increments NUM_ENEMIES_ACTIVE, measured on two builds - and
+	// asking again costs a round: enemy_spawn increments the counter and
+	// instance_destroy does not decrement it, so cleanup has to put it back by
+	// hand and a failed restore leaves a run that cannot finish.
+	void SetAllowSpawnProbes(bool Allow);
+
 	// Run the game's own matchup exporter and report what it produced, without
 	// sending anything anywhere.
 	//
@@ -113,9 +132,21 @@ namespace hmd::roster
 	// generation as suppressed. Safe to call when no enemies exist.
 	void ClearDefaultEnemyWave();
 
-	// Instantiate the peer's army as the opponent wave. Returns the number of
-	// units successfully spawned.
+	// Instantiate the peer's army as the opponent wave, using the game's own
+	// animal_generate + enemy_spawn pair. Returns the number of units spawned.
+	//
+	// Reads the enemies map of the peer's matchup payload - type name to count,
+	// already translated by BuildDuelPayload. Snapshot::units is not consulted:
+	// per-instance reads are dead on this build, and the counts are the army.
 	int InjectOpponentArmy(const Snapshot& Peer);
+
+	// Take the injected wave back out. Returns how many units were removed.
+	//
+	// Necessary because enemy_spawn increments NUM_ENEMIES_ACTIVE and
+	// instance_destroy does not decrement it, so a wave that is merely
+	// destroyed leaves the round unable to end. Safe to call when nothing was
+	// injected.
+	int RemoveInjectedWave();
 
 	// True while the mod wants the game's own wave composition suppressed.
 	bool IsDefaultWaveSuppressed();

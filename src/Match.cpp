@@ -724,6 +724,20 @@ namespace hmd::match
 		{
 			roster::SetDefaultWaveSuppressed(false);
 
+			// Anything the mod spawned comes out first, and before anything
+			// else decides what to tell the player.
+			//
+			// This matters more than it looks. An injected unit that is merely
+			// left behind holds NUM_ENEMIES_ACTIVE above zero forever, and the
+			// round then never ends - so an abandoned duel that skipped this
+			// would strand the run more thoroughly than the cleared wave it is
+			// apologising for.
+			const int withdrawn = roster::RemoveInjectedWave();
+
+			if (withdrawn > 0)
+				LogInfo("withdrew %d injected unit(s) while abandoning the duel",
+					withdrawn);
+
 			const int cleared = roster::EnemiesCleared();
 			roster::ResetEnemiesCleared();
 

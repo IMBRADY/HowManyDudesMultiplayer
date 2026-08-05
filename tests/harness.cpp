@@ -20,6 +20,7 @@
 #include "Json.h"
 #include "Log.h"
 #include "Net.h"
+#include "ProbeJournal.h"
 #include "Sanitize.h"
 
 #pragma comment(lib, "ws2_32.lib")
@@ -27,8 +28,10 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace hmd
 {
@@ -638,6 +641,164 @@ namespace
 		Check(ProgressFromAct(ActFromRound(60, 20), 20) == 60,
 			"and on a later one");
 	}
+
+	// --- The probe journal ------------------------------------------------
+	//
+	// This is here rather than in the game because the thing it protects
+	// against is a writer and a reader disagreeing about a line, and that class
+	// of bug has cost this project two rounds of play once already: a probe
+	// reported "no spawn code has been observed yet" while sitting on a full
+	// file, because the writer emitted three fields and the reader wanted four.
+	//
+	// The journal decides which probes a launch is allowed to run. If it reads
+	// its own output wrongly, a bisect either repeats a probe that kills the
+	// game or skips one that was never asked - and both look like results.
+	void TestProbeJournalFormat()
+	{
+		using namespace hmd::journal;
+
+		printf("\n[journal] a line survives a round trip\n");
+
+		Check(FormatLine("payload/3-boss", Status::Attempted) ==
+			"payload/3-boss attempted\n", "attempted renders as two tokens");
+
+		Check(FormatLine("x", Status::Survived) == "x survived\n",
+			"and so does survived");
+
+		Check(FormatLine("x", Status::Skipped) == "x skipped\n",
+			"and skipped");
+
+		// An id with whitespace would write a line that parses as a different
+		// id plus a junk status. It cannot happen from a literal, which is
+		// exactly why it would go unnoticed if it ever did.
+		Check(FormatLine("two words", Status::Attempted) ==
+			"two_words attempted\n", "whitespace in an id is closed off");
+
+		const std::vector<Entry> round_trip = Parse(
+			FormatLine("a/1", Status::Attempted) +
+			FormatLine("a/1", Status::Survived));
+
+		Check(round_trip.size() == 2, "both lines parse back");
+		Check(round_trip.size() == 2 && round_trip[0].id == "a/1" &&
+			round_trip[0].status == Status::Attempted,
+			"the first keeps its id and status");
+		Check(round_trip.size() == 2 && round_trip[1].status == Status::Survived,
+			"and so does the second");
+
+		printf("\n[journal] a torn file yields everything before the tear\n");
+
+		// The ordinary result of the process dying mid-write. A parser that
+		// gives up here would report an empty journal and re-run the probe
+		// that just killed the game.
+		const std::vector<Entry> torn =
+			Parse("a attempted\nb survived\nc att");
+
+		Check(torn.size() == 2, "the complete lines survive a truncated last one");
+
+		Check(Parse("").empty(), "an empty journal parses to nothing");
+		Check(Parse("\n\n\n").empty(), "and so does a file of blank lines");
+		Check(Parse("nonsense here\n").empty(),
+			"an unknown status is dropped rather than guessed");
+		Check(Parse("lonely\n").empty(), "and so is a line with no status");
+
+		// A journal written by a future build with extra columns must not read
+		// as garbage - the first two tokens are the contract.
+		const std::vector<Entry> extra = Parse("a attempted 12:01:33 whatever\n");
+		Check(extra.size() == 1 && extra[0].status == Status::Attempted,
+			"trailing columns are ignored rather than fatal");
+	}
+
+	void TestProbeJournalDecides()
+	{
+		using namespace hmd::journal;
+
+		printf("\n[journal] what a launch is allowed to run\n");
+
+		const auto path = std::filesystem::temp_directory_path() /
+			"hmd_probe_journal_test.txt";
+
+		std::error_code ignored;
+		std::filesystem::remove(path, ignored);
+
+		{
+			Journal fresh(path);
+
+			Check(!fresh.WasEverAttempted("injection/generate-spawn"),
+				"nothing is attempted in a journal that does not exist yet");
+			Check(!fresh.IsProvenLethal("injection/generate-spawn"),
+				"and nothing is lethal");
+		}
+
+		{
+			// A probe that ran and came back.
+			Journal survivor(path);
+			survivor.Record("apply/one", Status::Attempted);
+			survivor.Record("apply/one", Status::Survived);
+
+			Check(survivor.WasEverAttempted("apply/one"),
+				"an entry recorded this session counts immediately");
+			Check(!survivor.IsProvenLethal("apply/one"),
+				"one that came back is not lethal");
+		}
+
+		{
+			// A probe that armed and never returned - the game died inside it.
+			// Nothing writes the Survived line in that case, which is the
+			// entire signal.
+			Journal casualty(path);
+			casualty.Record("apply/two", Status::Attempted);
+		}
+
+		{
+			Journal next_launch(path);
+
+			Check(next_launch.WasEverAttempted("apply/one"),
+				"a survival is still on record after a relaunch");
+			Check(!next_launch.IsProvenLethal("apply/one"),
+				"and is still not lethal");
+
+			Check(next_launch.WasEverAttempted("apply/two"),
+				"so is an attempt that never returned");
+			Check(next_launch.IsProvenLethal("apply/two"),
+				"and that one is what killed the game");
+
+			Check(next_launch.Lethal().size() == 1,
+				"exactly one entry is named as lethal");
+			Check(next_launch.Lethal().size() == 1 &&
+				next_launch.Lethal().front() == "apply/two",
+				"and it is the one that did not come back");
+
+			// Skipping is not consuming. A probe the mod declined to run has
+			// not had its launch, and the next press must ask again - "SKIPPED
+			// BY THE MOD is not a pass" is a lesson this file now enforces.
+			next_launch.Record("apply/three", Status::Skipped);
+
+			Check(!next_launch.WasEverAttempted("apply/three"),
+				"a skip does not consume the entry");
+			Check(!next_launch.IsProvenLethal("apply/three"),
+				"and does not make it look lethal");
+		}
+
+		{
+			Journal after_skip(path);
+			Check(!after_skip.WasEverAttempted("apply/three"),
+				"a skip is still not a consumption after a relaunch");
+		}
+
+		{
+			Journal to_clear(path);
+			to_clear.Clear();
+
+			Check(!to_clear.WasEverAttempted("apply/one"),
+				"clearing re-opens every question");
+			Check(to_clear.Lethal().empty(), "including the lethal ones");
+		}
+
+		Check(!std::filesystem::exists(path, ignored),
+			"and it removes the file");
+
+		std::filesystem::remove(path, ignored);
+	}
 }
 
 int main()
@@ -645,6 +806,8 @@ int main()
 	printf("HowManyDudesMultiplayer - offline test harness\n");
 
 	TestDuelSchedule();
+	TestProbeJournalFormat();
+	TestProbeJournalDecides();
 
 	TestJsonBasics();
 	TestJsonRobustness();

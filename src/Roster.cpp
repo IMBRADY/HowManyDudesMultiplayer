@@ -3,6 +3,7 @@
 #include "Roster.h"
 #include "GameBridge.h"
 #include "GameHooks.h"
+#include "ProbeJournal.h"
 #include "RunState.h"
 #include "Log.h"
 #include "Sanitize.h"
@@ -15,7 +16,10 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <optional>
 #include <sstream>
+#include <vector>
 
 using namespace YYTK;
 
@@ -778,12 +782,22 @@ namespace hmd::roster
 	// the answer is a type mapping, not a redesign.
 	namespace
 	{
-		std::filesystem::path StageMarkerPath()
+		// One journal for every probe that can end the process, replacing the
+		// two single-integer markers (selftest_stage.txt, selftest_apply.txt)
+		// this used to keep. Those recorded a position in one hardcoded
+		// sequence; this records stable ids, so probes can be added, removed or
+		// reordered without a recorded answer quietly changing what it refers
+		// to. See ProbeJournal.h.
+		//
+		// The old marker files are ignored rather than migrated. Their contents
+		// are indices into sequences that no longer exist in that order, and a
+		// wrong resume is worse than a repeated one.
+		std::filesystem::path JournalPath()
 		{
 			const auto directory = ModuleDirectory();
 			return directory.empty()
 				? std::filesystem::path{}
-				: directory / L"selftest_stage.txt";
+				: directory / L"selftest_journal.txt";
 		}
 
 		// aurie.log is truncated on every launch, and a bisect whose failure
@@ -847,68 +861,276 @@ namespace hmd::roster
 			AppendToTranscript(message);
 		}
 
-		// The payload bisect and the apply probe are separate sequences and fail
-		// independently, so they keep separate markers.
-		std::filesystem::path ApplyMarkerPath()
+		// -------------------------------------------------------------------
+		// The probe manifest
+		// -------------------------------------------------------------------
+		//
+		// Every question this self-test can ask is an entry in one ordered
+		// list, and what an entry costs to ask is a property of the entry
+		// rather than of the sequence it happens to sit in.
+		//
+		// The distinction that matters is lethality, because it decides how
+		// many entries one launch can consume:
+		//
+		//   Safe   - cannot abort the runtime. Reads, enumerations, existence
+		//            checks, anything answered without calling an unproven GML
+		//            routine. Dozens of these fit in one press and none of them
+		//            need the journal at all.
+		//
+		//   Typed  - may raise a GML error. A typed error is recoverable on
+		//            this build and names its own cause, so these are batched
+		//            like Safe entries but journalled like Fatal ones, because
+		//            the classification is a judgement and judgements are wrong
+		//            sometimes.
+		//
+		//   Fatal  - may take the process down. One per launch, in order,
+		//            journalled before the call so the next launch resumes past
+		//            whichever one did not come back.
+		//
+		// Sessions were spent asking a Safe question at the cost of a Fatal one
+		// because everything went through the same one-per-launch bisect. This
+		// is that separation, made explicit.
+		enum class Lethality
 		{
-			const auto directory = ModuleDirectory();
-			return directory.empty()
-				? std::filesystem::path{}
-				: directory / L"selftest_apply.txt";
+			Safe,
+			Typed,
+			Fatal,
+		};
+
+		// What a probe body reports back. Skipped means the game never saw the
+		// thing being tested - a missing script, an unmet precondition, nothing
+		// to feed it. Skipped is NOT an answer and never consumes the entry;
+		// the next launch asks again.
+		enum class Outcome
+		{
+			Answered,
+			Skipped,
+		};
+
+		// A probe body arms the journal immediately before its first call into
+		// the game, and not one line earlier. Everything before that point -
+		// resolving arguments, checking preconditions, reading counters - is
+		// work that cannot kill anything, and journalling it would spend the
+		// entry's one launch on a question that was never asked.
+		using Arm = std::function<void()>;
+		using ProbeBody = std::function<Outcome(const Arm&)>;
+
+		struct ProbeEntry
+		{
+			// Stable, unique, and never reused for a different question. This
+			// is what the journal records; renaming one re-opens it.
+			std::string id;
+
+			// What appears in the transcript above the result.
+			std::string title;
+
+			Lethality lethality = Lethality::Fatal;
+
+			ProbeBody body;
+		};
+
+		journal::Journal& ProbeJournal()
+		{
+			static journal::Journal instance(JournalPath());
+			return instance;
 		}
 
-		// The marker is written before a step calls into the game and removed
-		// the moment that step survives. So a marker present at startup means
-		// precisely one thing: that step was attempted and never came back.
-		void MarkAttempted(const std::filesystem::path& Path, int Index)
+		// Should this entry run on this press?
+		//
+		// Only Fatal entries are rationed. They get one launch each: attempted
+		// once, never again, whether they survived or not - because from the
+		// journal's side "armed and returned" and "armed and took the process
+		// with it" are the same evidence until a Survived line appears.
+		//
+		// Safe and Typed entries run every press. Repeating a read costs
+		// nothing, and their answers move as the run progresses - which round
+		// it is, what the export holds, which enemies are legal now. Rationing
+		// those is what made whole sessions cost one bit.
+		//
+		// The exception is the same for all three, and is the reason Safe
+		// entries are journalled at all: an entry that was attempted and never
+		// returned is skipped regardless of what it was classified as. A
+		// misclassified probe stops the bisect once instead of killing every
+		// launch at the same line forever.
+		bool ShouldRun(const ProbeEntry& Entry, std::string& WhyNot)
 		{
-			if (Path.empty())
-				return;
+			const journal::Journal& log = ProbeJournal();
 
-			std::ofstream file(Path, std::ios::trunc);
-			if (file)
-				file << Index;
+			if (log.IsProvenLethal(Entry.id))
+			{
+				WhyNot = Entry.lethality == Lethality::Fatal
+					? "it was attempted on an earlier launch and never returned"
+					: "it was NOT classified as fatal and then killed the game "
+					  "anyway - that is a bug in the classification, and the "
+					  "entry needs reclassifying before it is run again";
+				return false;
+			}
+
+			if (Entry.lethality != Lethality::Fatal)
+				return true;
+
+			if (log.WasEverAttempted(Entry.id))
+			{
+				WhyNot = "already had its launch";
+				return false;
+			}
+
+			return true;
 		}
 
-		void ClearMarker(const std::filesystem::path& Path)
+		// Run the manifest in order, consuming as much of it as this launch
+		// survives.
+		//
+		// Returns the number of Fatal/Typed entries still unanswered when this
+		// press finished, so the caller can say whether another launch is
+		// needed - which is the one thing an unattended relaunch loop has to
+		// know, and the one thing the old integer markers could not report.
+		int RunManifest(const std::vector<ProbeEntry>& Manifest)
 		{
-			if (Path.empty())
-				return;
+			journal::Journal& log = ProbeJournal();
 
-			std::error_code error;
-			std::filesystem::remove(Path, error);
-		}
+			int answered_now = 0;
+			int skipped_now = 0;
+			int already = 0;
+			int outstanding = 0;
 
-		// -1 when nothing is on record.
-		int ReadIndexThatDidNotReturn(const std::filesystem::path& Path)
-		{
-			if (Path.empty())
-				return -1;
+			for (const ProbeEntry& entry : Manifest)
+			{
+				std::string why_not;
 
-			std::ifstream file(Path);
-			if (!file)
-				return -1;
+				if (!ShouldRun(entry, why_not))
+				{
+					already++;
 
-			int index = -1;
-			if (!(file >> index))
-				return -1;
+					SelfTestLog("--- %s [%s] - not run: %s", entry.title.c_str(),
+						entry.id.c_str(), why_not.c_str());
+					continue;
+				}
 
-			return index >= 0 ? index : -1;
-		}
+				SelfTestLog("--- %s [%s] ---", entry.title.c_str(),
+					entry.id.c_str());
 
-		void MarkStageAttempted(int Stage)
-		{
-			MarkAttempted(StageMarkerPath(), Stage);
-		}
+				// Armed by the body, immediately before it calls into the
+				// game. A body that returns without arming never reached the
+				// game, so nothing is recorded and the question stays open for
+				// the next launch.
+				//
+				// The converse is the rule that makes the bisect terminate:
+				// once armed, the entry is spent. A probe that armed and then
+				// found it could not proceed does not get a second launch,
+				// because from the journal's side that is indistinguishable
+				// from one that armed and died.
+				bool armed = false;
 
-		void ClearStageMarker()
-		{
-			ClearMarker(StageMarkerPath());
-		}
+				const Arm arm = [&]()
+				{
+					if (armed)
+						return;
 
-		int ReadStageThatDidNotReturn()
-		{
-			return ReadIndexThatDidNotReturn(StageMarkerPath());
+					armed = true;
+					log.Record(entry.id, journal::Status::Attempted);
+
+					// Safe entries are journalled too - that is the net under
+					// a misclassification - but they should not print a line
+					// that makes a read look like a gamble.
+					switch (entry.lethality)
+					{
+					case Lethality::Fatal:
+						SelfTestLog("    HANDED TO THE GAME - if the transcript "
+							"ends here, this is what killed it");
+						break;
+
+					case Lethality::Typed:
+						SelfTestLog("    calling into the game - a typed error "
+							"here is recoverable and names its own cause");
+						break;
+
+					case Lethality::Safe:
+						break;
+					}
+				};
+
+				const Outcome outcome = entry.body
+					? entry.body(arm)
+					: Outcome::Skipped;
+
+				if (armed)
+					log.Record(entry.id, journal::Status::Survived);
+
+				if (outcome == Outcome::Skipped)
+				{
+					skipped_now++;
+
+					// Recorded so the transcript shows the entry was
+					// considered. Skipped is not a consumption: WasEverAttempted
+					// only looks at Attempted lines, so this entry is still on
+					// the list for the next launch.
+					log.Record(entry.id, journal::Status::Skipped);
+					continue;
+				}
+
+				answered_now++;
+			}
+
+			SelfTestLog("=== manifest: %d answered this press, %d skipped, %d "
+				"already on record ===", answered_now, skipped_now, already);
+
+			// Recomputed against the journal as it now stands rather than from
+			// the counters above, because an entry the body armed and survived
+			// is answered even if this press also skipped others.
+			//
+			// Only Fatal entries can be outstanding. The rest run every press,
+			// so "waiting for a launch" is not a state they can be in.
+			std::vector<std::string> waiting;
+
+			for (const ProbeEntry& entry : Manifest)
+			{
+				if (entry.lethality != Lethality::Fatal)
+					continue;
+
+				if (!log.WasEverAttempted(entry.id))
+					waiting.push_back(entry.id);
+			}
+
+			outstanding = static_cast<int>(waiting.size());
+
+			const std::vector<std::string> lethal = log.Lethal();
+
+			if (!lethal.empty())
+			{
+				SelfTestLog("=== %zu probe(s) have killed the game and will not "
+					"be retried: ===", lethal.size());
+
+				for (const std::string& id : lethal)
+					SelfTestLog("        %s", id.c_str());
+			}
+
+			// The line an unattended relaunch loop watches for. It means every
+			// question that needs its own launch has had one, and relaunching
+			// again would learn nothing new.
+			if (outstanding == 0)
+			{
+				SelfTestLog("=== MANIFEST COMPLETE - every entry that needs its "
+					"own launch has had one. Hold shift with F5 to start over ===");
+
+				return 0;
+			}
+
+			// Named, not just counted. An entry can sit here for two very
+			// different reasons - it has not had its turn yet, or its
+			// precondition is never going to be met on this machine - and a
+			// bare number cannot be told apart from a stuck loop.
+			SelfTestLog("=== %d entr%s still waiting for a launch of their own: "
+				"===", outstanding, outstanding == 1 ? "y is" : "ies are");
+
+			for (const std::string& id : waiting)
+				SelfTestLog("        %s", id.c_str());
+
+			SelfTestLog("=== if one of those was skipped above rather than run, "
+				"read why: a precondition that cannot be met here will keep it "
+				"on this list no matter how many times you relaunch ===");
+
+			return outstanding;
 		}
 
 		// An RValue rendered as kind AND value.
@@ -1185,10 +1407,8 @@ namespace hmd::roster
 		// True when the stage was reached and returned. False only means it was
 		// skipped before the game was involved - a stage the game rejects fatally
 		// never returns at all.
-		bool RunSelfTestStage(const SelfTestStage& Stage, int Index, int Last)
+		Outcome RunSelfTestStage(const SelfTestStage& Stage, const Arm& Arm)
 		{
-			SelfTestLog("--- stage %d of %d: %s ---", Index, Last,
-				Stage.name.c_str());
 			SelfTestLog("    asks: %s", Stage.asks.c_str());
 			SelfTestLog("    payload is %zu bytes", Stage.payload.size());
 
@@ -1201,7 +1421,7 @@ namespace hmd::roster
 				SelfTestWarn("    SKIPPED BY THE MOD - this no longer looks like "
 					"a matchup, so the mod built it wrong and the game never saw "
 					"it. This is not a result about the game");
-				return false;
+				return Outcome::Skipped;
 			}
 
 			auto as_struct = ParseJsonToStruct(Stage.payload);
@@ -1210,19 +1430,15 @@ namespace hmd::roster
 				SelfTestWarn("    SKIPPED BY THE MOD - json_parse would not turn "
 					"it into a struct, so custom_matchup_parse was never called. "
 					"This is not a result about the game");
-				return false;
+				return Outcome::Skipped;
 			}
 
 			const int enemies_before = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
 			const int dudes_before = ReadGlobalCount("NUM_DUDES_ACTIVE");
 
-			// On disk before the call, because the call is the thing that may
-			// not return. If the game dies here, the next F5 press reads this
-			// and resumes past it.
-			MarkStageAttempted(Index);
-
-			SelfTestLog("    HANDED TO THE GAME - if the transcript ends here, "
-				"this stage is the one that kills it");
+			// Journalled here, because the next statement is the one that may
+			// not return.
+			Arm();
 
 			RValue parsed;
 			if (!bridge::CallScriptAnnounced(
@@ -1230,11 +1446,8 @@ namespace hmd::roster
 			{
 				SelfTestWarn("    SKIPPED - custom_matchup_parse could not be "
 					"called at all");
-				ClearStageMarker();
-				return false;
+				return Outcome::Skipped;
 			}
-
-			ClearStageMarker();
 
 			const int enemies_after = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
 			const int dudes_after = ReadGlobalCount("NUM_DUDES_ACTIVE");
@@ -1247,7 +1460,7 @@ namespace hmd::roster
 			SelfTestLog("    NUM_ENEMIES_ACTIVE %d -> %d, NUM_DUDES_ACTIVE %d -> %d",
 				enemies_before, enemies_after, dudes_before, dudes_after);
 
-			return true;
+			return Outcome::Answered;
 		}
 	}
 
@@ -1556,6 +1769,17 @@ namespace hmd::roster
 			return static_cast<int>(raw);
 		}
 
+		// Defined with the other registry helpers, below the injection probe.
+		// Declared here because the spawn probe needs both: one to decide
+		// whether a harvested code still resolves to anything, and one to put
+		// the enemy counter back after a spawn it has to undo.
+		std::optional<bool> RegistryHasKey(
+			const char* GlobalName,
+			const std::string& Key
+		);
+
+		bool RestoreGlobalCount(const char* Name, int Value);
+
 		std::filesystem::path SpawnProbeMarkerPath()
 		{
 			const auto directory = ModuleDirectory();
@@ -1564,18 +1788,20 @@ namespace hmd::roster
 				: directory / L"selftest_spawn.txt";
 		}
 
-		void RunDirectSpawnProbe()
+		// The journal entry for this probe records that the probe was run; the
+		// marker file below records which spawn CODE did not return. Both are
+		// needed and they are not the same thing: the lethal item here is data
+		// the probe picked up, so a code that killed the game must stay
+		// untouchable even on a press where the probe itself is fresh.
+		Outcome RunDirectSpawnProbe(const Arm& Arm)
 		{
-			SelfTestLog("=== direct spawn probe: call the game's own enemy_spawn "
-				"the way the game calls it ===");
-
 			const std::vector<SpawnCall> calls = LoadSpawnCalls();
 			if (calls.empty())
 			{
 				SelfTestWarn("    no spawn code has been observed yet. Play a "
 					"round with this build loaded - the observers write one "
 					"down as the game spawns its wave - then press F5 again");
-				return;
+				return Outcome::Skipped;
 			}
 
 			const int round = CurrentWaveRound();
@@ -1602,7 +1828,7 @@ namespace hmd::roster
 					"code from another round is what killed the game last time, "
 					"so nothing is called. Play this round's wave in and press "
 					"F5 again", round);
-				return;
+				return Outcome::Skipped;
 			}
 
 			// A code that was attempted and never returned is not attempted
@@ -1615,8 +1841,54 @@ namespace hmd::roster
 				SelfTestWarn("    \"%s\" was attempted and never returned last "
 					"time. Not retrying it. Delete selftest_spawn.txt to force "
 					"another attempt", died_on.c_str());
-				return;
+				return Outcome::Skipped;
 			}
+
+			// The guard that was missing, and the reason this probe broke a
+			// live run.
+			//
+			// A spawn code is not a name. It is a per-spawn unique key into
+			// global.ANIMALS, and that entry is DELETED when the enemy holding
+			// it dies. Replaying a code whose record has gone hands enemy_spawn
+			// a key that resolves to nothing: setup takes undefined for an I32,
+			// the construction aborts halfway, and a half-built o_combatant is
+			// left in the round. That unit cannot finish dying, so the wave
+			// never resolves, and the next thing to touch it faults.
+			//
+			// Measured, 23:05:32: enemy_spawn("nmn", -379.917, -395.183) raised
+			// "I32 argument is undefined" inside
+			// gml_Script_setup@gml_Object_o_combatant_Create_0:405. The round
+			// stopped progressing and the game died four seconds later in
+			// o_bs_cursor's Step event.
+			//
+			// The round-gate above was always a proxy for this check and a poor
+			// one: enemies die constantly during a fight, so a code harvested
+			// this round is usually dead by the time anyone presses F5. It also
+			// explains the earlier conclusion that a round 1 code "crashed in
+			// round 2" - the round was never the variable, the record was.
+			const auto record_exists = RegistryHasKey("ANIMALS", chosen->code);
+
+			if (!record_exists.has_value())
+			{
+				SelfTestWarn("    global.ANIMALS could not be read as a struct, "
+					"so whether \"%s\" still has a record is unknown. Not "
+					"calling - an absent record is what breaks the round",
+					chosen->code.c_str());
+				return Outcome::Skipped;
+			}
+
+			if (!*record_exists)
+			{
+				SelfTestWarn("    \"%s\" has no record in global.ANIMALS any "
+					"more - the enemy that owned it is dead and its entry went "
+					"with it. Replaying it would abort inside the combatant's "
+					"Create event and leave a half-built unit the round can "
+					"never finish. Not calling.", chosen->code.c_str());
+				return Outcome::Skipped;
+			}
+
+			SelfTestLog("    \"%s\" still has a record in global.ANIMALS, so the "
+				"key resolves to something", chosen->code.c_str());
 
 			const int enemies_before = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
 			const int instances_before = CountEnemyInstances();
@@ -1630,6 +1902,8 @@ namespace hmd::roster
 				if (marker)
 					marker << chosen->code;
 			}
+
+			Arm();
 
 			RValue spawned;
 			const bool called = bridge::CallScriptAnnounced(
@@ -1645,7 +1919,7 @@ namespace hmd::roster
 			if (!called)
 			{
 				SelfTestWarn("    enemy_spawn could not be called");
-				return;
+				return Outcome::Skipped;
 			}
 
 			const int enemies_after = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
@@ -1692,6 +1966,28 @@ namespace hmd::roster
 					destroyed ? "instance_destroy called" : "instance_destroy "
 					"could not be called", instances_final);
 
+				// instance_destroy does not decrement NUM_ENEMIES_ACTIVE - the
+				// game does that on its own death path. A leaked count means
+				// the round never ends. See RestoreGlobalCount.
+				const int enemies_cleaned = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
+
+				if (enemies_cleaned != enemies_before && enemies_before >= 0)
+				{
+					SelfTestWarn("    the counter did NOT come back down. "
+						"Restoring NUM_ENEMIES_ACTIVE to %d so the round can "
+						"still end.", enemies_before);
+
+					RestoreGlobalCount("NUM_ENEMIES_ACTIVE", enemies_before);
+
+					const int enemies_final =
+						ReadGlobalCount("NUM_ENEMIES_ACTIVE");
+
+					if (enemies_final != enemies_before)
+						SelfTestWarn("    THE ROUND COUNTER COULD NOT BE PUT "
+							"BACK. This round will not finish when its last "
+							"enemy dies. Abandon the run.");
+				}
+
 				if (instances_final > instances_before)
 				{
 					SelfTestWarn("    THE SPAWNED UNIT COULD NOT BE REMOVED. "
@@ -1699,6 +1995,8 @@ namespace hmd::roster
 						"is carrying a unit the game did not build");
 				}
 			}
+
+			return Outcome::Answered;
 		}
 
 		// ------------------------------------------------------------------
@@ -1872,138 +2170,744 @@ namespace hmd::roster
 		// Nothing is invented. The stats, the callbacks and the sprites all come
 		// from the game's own construction, which is the failure mode of every
 		// previous attempt and the reason a spawned unit hard-faulted the game.
-		void RunRealInjectionProbe()
+		// Is Key present in the struct held by global.<GlobalName>?
+		//
+		// nullopt distinguishes "the global is not something that can be asked"
+		// from "it can, and the answer is no". Those look identical in a log
+		// that only prints a bool, and this project has already spent rounds of
+		// play on a diagnostic that could not tell absence from unreadability.
+		std::optional<bool> RegistryHasKey(
+			const char* GlobalName,
+			const std::string& Key
+		)
 		{
-			SelfTestLog("=== injection probe: animal_generate + enemy_spawn ===");
+			auto registry = bridge::GetGlobal(GlobalName);
+			if (!registry)
+				return std::nullopt;
 
-			if (!bridge::ScriptExists("gml_Script_animal_generate"))
-			{
-				SelfTestWarn("    animal_generate does not exist on this build");
-				return;
-			}
+			// Structs only. A ds_map is a bare number, and handing one to a
+			// struct builtin is the class of move that has killed this game.
+			const bool struct_shaped = registry->m_Kind == VALUE_OBJECT ||
+				registry->m_Kind == VALUE_REF;
 
-			// A type this round legitimately contains, so nothing depends on
-			// guessing what is legal. The export names them and the game
-			// validated them by fighting them.
+			if (!struct_shaped || !registry->m_Pointer)
+				return std::nullopt;
+
+			auto exists = bridge::CallBuiltin("variable_struct_exists",
+				{ *registry, RValue(Key) });
+
+			if (!exists || exists->m_Kind != VALUE_BOOL)
+				return std::nullopt;
+
+			return exists->ToBoolean();
+		}
+
+		// Read one key out of a global registry, or nullopt.
+		std::optional<RValue> RegistryGet(
+			const char* GlobalName,
+			const std::string& Key
+		)
+		{
+			auto registry = bridge::GetGlobal(GlobalName);
+			if (!registry)
+				return std::nullopt;
+
+			const bool struct_shaped = registry->m_Kind == VALUE_OBJECT ||
+				registry->m_Kind == VALUE_REF;
+
+			if (!struct_shaped || !registry->m_Pointer)
+				return std::nullopt;
+
+			return bridge::CallBuiltin("variable_struct_get",
+				{ *registry, RValue(Key) });
+		}
+
+		bool RegistrySet(
+			const char* GlobalName,
+			const std::string& Key,
+			const RValue& Value
+		)
+		{
+			auto registry = bridge::GetGlobal(GlobalName);
+			if (!registry)
+				return false;
+
+			const bool struct_shaped = registry->m_Kind == VALUE_OBJECT ||
+				registry->m_Kind == VALUE_REF;
+
+			if (!struct_shaped || !registry->m_Pointer)
+				return false;
+
+			return bridge::CallBuiltin("variable_struct_set",
+				{ *registry, RValue(Key), Value }).has_value();
+		}
+
+		// The value the game itself stores in a registry, taken from whatever
+		// entry is already in it.
+		//
+		// Needed because writing "true" from here is not as simple as it looks.
+		// RValue's integral constructor produces a VALUE_INT64 of 1, which GML
+		// treats as truthy but which is not the same kind the game's own code
+		// puts there - and this project's whole method is to stop inventing
+		// values the game is perfectly able to supply. So the flag written into
+		// ANIMALS_CONSCIOUS is a copy of one the game wrote, kind included.
+		//
+		// nullopt when the registry is empty or unreadable, which is the honest
+		// answer: there is then no observed value to copy.
+		std::optional<RValue> RegistryAnyValue(const char* GlobalName)
+		{
+			auto registry = bridge::GetGlobal(GlobalName);
+			if (!registry)
+				return std::nullopt;
+
+			const bool struct_shaped = registry->m_Kind == VALUE_OBJECT ||
+				registry->m_Kind == VALUE_REF;
+
+			if (!struct_shaped || !registry->m_Pointer)
+				return std::nullopt;
+
+			auto names = bridge::CallBuiltin("struct_get_names", { *registry });
+			if (!names || names->m_Kind != VALUE_ARRAY)
+				return std::nullopt;
+
+			auto length = bridge::CallBuiltin("array_length", { *names });
+			if (!length || (length->m_Kind != VALUE_REAL &&
+				length->m_Kind != VALUE_INT32 && length->m_Kind != VALUE_INT64))
+				return std::nullopt;
+
+			if (static_cast<int>(length->ToDouble()) <= 0)
+				return std::nullopt;
+
+			auto first = bridge::CallBuiltin("array_get",
+				{ *names, RValue(0.0) });
+
+			if (!first || first->m_Kind != VALUE_STRING)
+				return std::nullopt;
+
+			return bridge::CallBuiltin("variable_struct_get",
+				{ *registry, *first });
+		}
+
+		// Put a numeric global back where it was found.
+		//
+		// This exists because of the measurement that explains both frozen
+		// rounds: enemy_spawn INCREMENTS NUM_ENEMIES_ACTIVE, and
+		// instance_destroy does NOT decrement it. The game decrements it on its
+		// own death path, which destroying the instance walks straight past.
+		//
+		//     23:53:09  o_enemy instances 10 -> 11, NUM_ENEMIES_ACTIVE 10 -> 11
+		//     23:53:09  cleaned up: instances now 10, NUM_ENEMIES_ACTIVE now 11
+		//
+		// One leaked count. The round then waits forever for an enemy that does
+		// not exist: every real enemy dies, the counter reads 1, and the
+		// post-battle screen never comes. That is the freeze, both nights, and
+		// it is not the crash - the crash was a separate thing on a dead key.
+		//
+		// Restoring the measured before-value is exact rather than clever. The
+		// right long-term answer is to kill the unit through the game's own
+		// death path so the game does its own bookkeeping; combatant_hp_set is
+		// the obvious candidate and its signature is not known yet.
+		bool RestoreGlobalCount(const char* Name, int Value)
+		{
+			return bridge::CallBuiltin("variable_global_set",
+				{ RValue(Name), RValue(static_cast<double>(Value)) }).has_value();
+		}
+
+		bool RegistryRemove(const char* GlobalName, const std::string& Key)
+		{
+			auto registry = bridge::GetGlobal(GlobalName);
+			if (!registry)
+				return false;
+
+			const bool struct_shaped = registry->m_Kind == VALUE_OBJECT ||
+				registry->m_Kind == VALUE_REF;
+
+			if (!struct_shaped || !registry->m_Pointer)
+				return false;
+
+			return bridge::CallBuiltin("variable_struct_remove",
+				{ *registry, RValue(Key) }).has_value();
+		}
+
+		// Render a registry answer without pretending unreadable means absent.
+		const char* PresenceText(const std::optional<bool>& Present)
+		{
+			if (!Present)
+				return "UNREADABLE (the global is not a struct this can ask)";
+
+			return *Present ? "present" : "absent";
+		}
+
+		// An enemy type name that is legal to generate, from whichever source
+		// can supply one.
+		//
+		// The old version read only this round's export, which meant the probe
+		// refused to run unless a wave was already on the field - so every
+		// attempt at the last open question cost a hand-played round first.
+		// None of the three sources here needs that:
+		//
+		//   1. this round's export - the strongest, because the game validated
+		//      these names by fighting them;
+		//   2. the round's own descriptor list, which is what the game asks
+		//      when it builds a wave, and which is measured safe to call;
+		//   3. the harvested vocabulary, which is real by construction - every
+		//      name in it was named by an export at some point.
+		std::string ResolveInjectableType(std::string& SourceOut)
+		{
 			const std::string exported = CaptureGameNativeExport();
 			json::Value root;
-			std::string type;
 
 			if (json::Parse(exported, root) && root.IsObject())
 			{
 				const json::Value& enemies = root["enemies"];
 				if (enemies.IsObject() && !enemies.Members().empty())
-					type = enemies.Members().begin()->first;
+				{
+					SourceOut = "this round's export";
+					return enemies.Members().begin()->first;
+				}
 			}
 
-			if (type.empty())
+			// Measured safe: it returns 24 descriptors and has been called
+			// across several sessions without incident. Called before the
+			// journal is armed for that reason - if that judgement is ever
+			// wrong, the entry that dies will be this one and the transcript
+			// will say so at the line above.
+			if (bridge::ScriptExists("gml_Script_enemies_get_available_for_round"))
 			{
-				SelfTestWarn("    could not read an enemy type from this round's "
-					"export - nothing safe to generate");
-				return;
+				RValue available;
+
+				if (bridge::CallScript("gml_Script_enemies_get_available_for_round",
+						{ RValue(static_cast<double>(CurrentWaveRound())),
+						  RValue(1.0) }, available) &&
+					available.m_Kind == VALUE_ARRAY)
+				{
+					auto first = bridge::CallBuiltin("array_get",
+						{ available, RValue(0.0) });
+
+					if (first && (first->m_Kind == VALUE_OBJECT ||
+						first->m_Kind == VALUE_REF) && first->m_Pointer)
+					{
+						auto id = bridge::CallBuiltin("variable_struct_get",
+							{ *first, RValue("id") });
+
+						if (id && id->m_Kind == VALUE_STRING && id->ToCString())
+						{
+							SourceOut = "this round's descriptor list";
+							return id->ToCString();
+						}
+					}
+				}
 			}
 
-			// Real coordinates, from a spawn the game performed this round.
+			const std::vector<std::string> vocabulary = LoadEnemyVocabulary();
+			if (!vocabulary.empty())
+			{
+				SourceOut = "the harvested vocabulary";
+				return vocabulary.front();
+			}
+
+			return {};
+		}
+
+		// Where to put the injected unit.
+		//
+		// A coordinate is not a spawn code. Replaying a code from another round
+		// is what killed a run, because a code is a key into a registry whose
+		// entry belonged to that round; a coordinate is two numbers, and
+		// enemies are already known to enter from off-screen at negative ones.
+		// So an older round's position is reused without ceremony, and only the
+		// case where nothing was ever observed falls back to a guess.
+		void ResolveInjectionPosition(double& X, double& Y, std::string& SourceOut)
+		{
 			const std::vector<SpawnCall> calls = LoadSpawnCalls();
 			const int round = CurrentWaveRound();
-
-			double x = 0.0;
-			double y = 0.0;
-			bool have_position = false;
 
 			for (const SpawnCall& call : calls)
 			{
 				if (call.round == round)
 				{
-					x = call.x;
-					y = call.y;
-					have_position = true;
+					X = call.x;
+					Y = call.y;
+					SourceOut = "a spawn the game performed this round";
+					return;
 				}
 			}
 
-			if (!have_position)
+			if (!calls.empty())
 			{
-				SelfTestWarn("    no spawn position observed in round %d - let "
-					"this round's wave spawn first", round);
+				X = calls.front().x;
+				Y = calls.front().y;
+				SourceOut = "a spawn from an earlier round (the position, not "
+					"the code)";
 				return;
 			}
 
-			const int instances_before = CountEnemyInstances();
-			const int enemies_before = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
+			// Arbitrary, off to the left, and labelled as such. The probe
+			// destroys what it creates, so a unit standing somewhere useless
+			// still answers the only question being asked - whether the wave
+			// counts it.
+			X = -64.0;
+			Y = 240.0;
+			SourceOut = "a guess - no spawn has ever been observed";
+		}
 
-			SelfTestLog("    calling animal_generate(\"%s\")", type.c_str());
+		// Whether a successful injection is left standing.
+		//
+		// Off by default, and it must stay that way for ordinary use: a probe
+		// that succeeds leaves a real extra enemy in a round somebody is
+		// playing, and a diagnostic has no business changing the difficulty of
+		// a run. It exists because the success signal this probe reads -
+		// NUM_ENEMIES_ACTIVE going up - is a proxy. What the duel actually
+		// needs is for the round to refuse to end while the injected unit
+		// lives, and that cannot be observed on a unit the probe deletes two
+		// lines later. Turning this on spends one run to measure it.
+		std::atomic<bool> g_InjectionPersist{ false };
 
+		// -------------------------------------------------------------------
+		// The injected wave
+		// -------------------------------------------------------------------
+		//
+		// Everything the mod puts into the arena is remembered, because
+		// removing it again is a separate problem from creating it and a harder
+		// one. AbandonDuel has to be able to put the round back.
+		struct InjectedUnit
+		{
+			std::string key;      // the ANIMALS key animal_generate chose
+			RValue instance;      // what enemy_spawn returned
+		};
+
+		std::vector<InjectedUnit> g_Injected;
+
+		// NUM_ENEMIES_ACTIVE as it stood before the mod spawned anything. The
+		// value removal has to get back to.
+		int g_EnemiesBeforeInjection = -1;
+
+		// A peer cannot be trusted to size our arena.
+		constexpr int kMaxUnitsPerType = 40;
+
+		struct SpawnPosition
+		{
+			double x = 0.0;
+			double y = 0.0;
+		};
+
+		// Where to put the opponent's army.
+		//
+		// Positions the game itself used are preferred, because they are known
+		// to be somewhere a wave can enter from - enemies come in from
+		// off-screen, and several observed spawns are at negative coordinates.
+		// A coordinate carries none of the danger a spawn CODE does: a code is
+		// a registry key that dies with its enemy, two numbers are two numbers.
+		//
+		// The fallback is a spread rather than a single point, so a wave that
+		// cannot use observed positions still arrives as a wave rather than as
+		// one pile.
+		std::vector<SpawnPosition> InjectionPositions()
+		{
+			std::vector<SpawnPosition> positions;
+
+			for (const SpawnCall& call : LoadSpawnCalls())
+				positions.push_back({ call.x, call.y });
+
+			if (!positions.empty())
+				return positions;
+
+			LogWarn("no spawn position has ever been observed - the opponent's "
+				"army will arrive on a guessed spread");
+
+			for (int i = 0; i < 8; i++)
+				positions.push_back({ -64.0 - (i % 4) * 48.0,
+					120.0 + (i / 4) * 96.0 });
+
+			return positions;
+		}
+
+		// One unit, by the game's own two calls. Returns false without leaving
+		// anything behind if it could not be built.
+		bool SpawnOneInjectedUnit(const std::string& Type, double X, double Y)
+		{
 			RValue record;
-			if (!bridge::CallScriptAnnounced("gml_Script_animal_generate",
-					{ RValue(type) }, record))
+			if (!bridge::CallScript("gml_Script_animal_generate",
+					{ RValue(Type) }, record))
 			{
-				SelfTestWarn("    animal_generate could not be called");
-				return;
+				LogWarn("animal_generate(\"%s\") could not be called",
+					Type.c_str());
+				return false;
 			}
-
-			SelfTestLog("    it returned %s", DescribeValue(record).c_str());
 
 			const bool record_shaped = record.m_Kind == VALUE_OBJECT ||
 				record.m_Kind == VALUE_REF;
 
 			if (!record_shaped || !record.m_Pointer)
 			{
-				SelfTestWarn("    that is not a record - stopping before "
-					"enemy_spawn rather than handing it something unusable");
-				return;
+				LogWarn("animal_generate(\"%s\") did not return a record - the "
+					"type is probably not an enemy type name", Type.c_str());
+				return false;
 			}
 
 			auto id = bridge::CallBuiltin("variable_struct_get",
 				{ record, RValue("id") });
 
-			if (!id || id->m_Kind != VALUE_STRING)
+			if (!id || id->m_Kind != VALUE_STRING || !id->ToCString())
 			{
-				SelfTestWarn("    the record has no string .id - the key the "
-					"spawner needs is not where it was expected");
-				return;
+				LogWarn("the record for \"%s\" has no string .id", Type.c_str());
+				return false;
 			}
 
-			const char* raw_id = id->ToCString();
-			if (!raw_id)
-				return;
+			const std::string key = id->ToCString();
 
-			const std::string key = raw_id;
-			SelfTestLog("    the record registered itself as \"%s\"", key.c_str());
+			// The key must resolve to a record before the spawner is given it.
+			// Handing enemy_spawn a key with no ANIMALS entry aborts inside the
+			// combatant's Create event and leaves a half-built unit the round
+			// can never finish killing. That cost a live run.
+			const auto registered = RegistryHasKey("ANIMALS", key);
 
-			SelfTestLog("    calling enemy_spawn(\"%s\", %g, %g)", key.c_str(),
+			if (!registered.has_value() || !*registered)
+			{
+				LogWarn("the record for \"%s\" did not register itself as "
+					"\"%s\" - not spawning it", Type.c_str(), key.c_str());
+				return false;
+			}
+
+			RValue spawned;
+			if (!bridge::CallScript("gml_Script_enemy_spawn",
+					{ *id, RValue(X), RValue(Y) }, spawned))
+			{
+				LogWarn("enemy_spawn(\"%s\") could not be called", key.c_str());
+				return false;
+			}
+
+			g_Injected.push_back({ key, spawned });
+			return true;
+		}
+
+		// Whether the two probes that put a unit into a live round may run.
+		//
+		// Off by default, because both of their questions are now ANSWERED and
+		// neither is free to ask. Measured twice, on two builds and two enemy
+		// types:
+		//
+		//     23:05:06  animal_generate("duck_sized_horse") -> "nmn"
+		//               NUM_ENEMIES_ACTIVE 6 -> 7    THE WAVE COUNTS IT
+		//     23:53:09  animal_generate("toddler") -> "czt"
+		//               NUM_ENEMIES_ACTIVE 10 -> 11  THE WAVE COUNTS IT
+		//
+		// Injection works. What remains is building the duel on it, not asking
+		// again - and asking again costs a round, because spawning is the easy
+		// half and un-spawning is not: the counter has to be put back by hand,
+		// and a restore that fails leaves a run that cannot finish.
+		//
+		// Kept rather than deleted because they are the only two things that
+		// can verify the mechanism against a build of the game, and because
+		// several sessions went into them.
+		std::atomic<bool> g_AllowSpawnProbes{ false };
+
+		// The whole injection, and the three questions after it, in one press.
+		//
+		// Each step here used to be its own launch: spawn it, then see whether
+		// the wave counts it, then find out where the count comes from, then
+		// try the registry. They are batched because only the first is capable
+		// of ending the process - once animal_generate and enemy_spawn have
+		// returned, everything left is reads and one struct write, and none of
+		// those has ever taken the game down.
+		//
+		//     record = animal_generate(type)   -> registers itself in ANIMALS
+		//     enemy_spawn(record.id, x, y)     -> the instance, from that record
+		//
+		// Nothing is invented. Stats, callbacks and sprites all come from the
+		// game's own construction, which is what every earlier attempt lacked
+		// and why a mod-spawned unit was half-built and eventually hard-faulted
+		// the game.
+		Outcome RunRealInjectionProbe(const Arm& Arm)
+		{
+			if (!bridge::ScriptExists("gml_Script_animal_generate"))
+			{
+				SelfTestWarn("    animal_generate does not exist on this build");
+				return Outcome::Skipped;
+			}
+
+			std::string type_source;
+			const std::string type = ResolveInjectableType(type_source);
+
+			if (type.empty())
+			{
+				SelfTestWarn("    no enemy type could be resolved from any of the "
+					"three sources - nothing safe to generate");
+				return Outcome::Skipped;
+			}
+
+			double x = 0.0;
+			double y = 0.0;
+			std::string position_source;
+			ResolveInjectionPosition(x, y, position_source);
+
+			SelfTestLog("    type \"%s\", from %s", type.c_str(),
+				type_source.c_str());
+			SelfTestLog("    position (%g, %g), from %s", x, y,
+				position_source.c_str());
+
+			const int instances_before = CountEnemyInstances();
+			const int enemies_before = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
+
+			SelfTestLog("    o_enemy instances %d, NUM_ENEMIES_ACTIVE %d before "
+				"anything is called", instances_before, enemies_before);
+
+			// ---------------------------------------------------------------
+			// 1. Generate the record.
+			// ---------------------------------------------------------------
+			SelfTestLog("    [1] calling animal_generate(\"%s\")", type.c_str());
+
+			Arm();
+
+			RValue record;
+			if (!bridge::CallScriptAnnounced("gml_Script_animal_generate",
+					{ RValue(type) }, record))
+			{
+				SelfTestWarn("    animal_generate could not be called");
+				return Outcome::Skipped;
+			}
+
+			SelfTestLog("        it returned %s", DescribeValue(record).c_str());
+
+			const bool record_shaped = record.m_Kind == VALUE_OBJECT ||
+				record.m_Kind == VALUE_REF;
+
+			if (!record_shaped || !record.m_Pointer)
+			{
+				SelfTestWarn("        that is not a record - stopping before "
+					"enemy_spawn rather than handing it something unusable");
+				return Outcome::Answered;
+			}
+
+			auto id = bridge::CallBuiltin("variable_struct_get",
+				{ record, RValue("id") });
+
+			if (!id || id->m_Kind != VALUE_STRING || !id->ToCString())
+			{
+				SelfTestWarn("        the record has no string .id - the key the "
+					"spawner needs is not where it was expected");
+				return Outcome::Answered;
+			}
+
+			const std::string key = id->ToCString();
+			SelfTestLog("        it registered itself as \"%s\"", key.c_str());
+
+			// ---------------------------------------------------------------
+			// 2. Census the registries before the spawn.
+			// ---------------------------------------------------------------
+			//
+			// Taken before rather than after, so that if the spawn is what
+			// populates a registry, that shows up as a change rather than as a
+			// state nobody can attribute.
+			const auto animals_before = RegistryHasKey("ANIMALS", key);
+			const auto conscious_before = RegistryHasKey("ANIMALS_CONSCIOUS", key);
+
+			SelfTestLog("    [2] global.ANIMALS[\"%s\"]           %s", key.c_str(),
+				PresenceText(animals_before));
+			SelfTestLog("        global.ANIMALS_CONSCIOUS[\"%s\"] %s", key.c_str(),
+				PresenceText(conscious_before));
+
+			// The key must resolve to a record before the spawner is given it.
+			//
+			// This is the same check the direct spawn probe was missing, and it
+			// cost a live run: enemy_spawn on a key with no ANIMALS entry aborts
+			// inside the combatant's Create event with "I32 argument is
+			// undefined" and leaves a half-built unit that the round can never
+			// finish killing.
+			//
+			// Here the record was generated moments ago and should be
+			// registered. If it is not, that is a finding about animal_generate
+			// worth having on its own - and it is one that must not be followed
+			// by a spawn.
+			if (!animals_before.has_value() || !*animals_before)
+			{
+				SelfTestWarn("        the generated record is NOT registered in "
+					"global.ANIMALS under its own .id, so enemy_spawn would "
+					"resolve it to nothing. Stopping here rather than leaving a "
+					"half-built unit in the round. animal_generate registering "
+					"itself was the assumption; it does not hold.");
+
+				if (bridge::ScriptExists("gml_Script_animal_delete"))
+				{
+					RValue ignored;
+					bridge::CallScript("gml_Script_animal_delete", { *id }, ignored);
+				}
+
+				return Outcome::Answered;
+			}
+
+			// ---------------------------------------------------------------
+			// 3. Spawn it.
+			// ---------------------------------------------------------------
+			SelfTestLog("    [3] calling enemy_spawn(\"%s\", %g, %g)", key.c_str(),
 				x, y);
 
 			RValue spawned;
-			if (!bridge::CallScriptAnnounced("gml_Script_enemy_spawn",
-					{ *id, RValue(x), RValue(y) }, spawned))
-			{
-				SelfTestWarn("    enemy_spawn could not be called");
-				return;
-			}
+			const bool spawn_called = bridge::CallScriptAnnounced(
+				"gml_Script_enemy_spawn", { *id, RValue(x), RValue(y) }, spawned);
 
-			const int instances_after = CountEnemyInstances();
-			const int enemies_after = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
+			if (!spawn_called)
+				SelfTestWarn("        enemy_spawn could not be called");
+			else
+				SelfTestLog("        SURVIVED. it returned %s",
+					DescribeValue(spawned).c_str());
 
-			SelfTestLog("    SURVIVED. enemy_spawn returned %s",
-				DescribeValue(spawned).c_str());
+			const int instances_spawned = CountEnemyInstances();
+			const int enemies_spawned = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
 
-			SelfTestLog("    o_enemy instances    %d -> %d", instances_before,
-				instances_after);
+			SelfTestLog("        o_enemy instances    %d -> %d%s",
+				instances_before, instances_spawned,
+				instances_spawned > instances_before
+					? "   <<< THE UNIT EXISTS"
+					: "   (nothing was created)");
 
-			SelfTestLog("    NUM_ENEMIES_ACTIVE   %d -> %d%s",
-				enemies_before, enemies_after,
-				enemies_after > enemies_before
+			SelfTestLog("        NUM_ENEMIES_ACTIVE   %d -> %d%s",
+				enemies_before, enemies_spawned,
+				enemies_spawned > enemies_before
 					? "   <<< THE WAVE COUNTS IT - INJECTION WORKS"
 					: "   (still not counted)");
 
-			// Cleaned up either way. A successful injection is a real extra
-			// enemy in a round the tester is playing, and a diagnostic has no
-			// business changing the difficulty of somebody's run.
-			if (instances_after > instances_before &&
+			const auto animals_after = RegistryHasKey("ANIMALS", key);
+			const auto conscious_after = RegistryHasKey("ANIMALS_CONSCIOUS", key);
+
+			SelfTestLog("        global.ANIMALS[\"%s\"]           %s -> %s",
+				key.c_str(), PresenceText(animals_before),
+				PresenceText(animals_after));
+			SelfTestLog("        global.ANIMALS_CONSCIOUS[\"%s\"] %s -> %s",
+				key.c_str(), PresenceText(conscious_before),
+				PresenceText(conscious_after));
+
+			// ---------------------------------------------------------------
+			// 4. If the wave did not count it, try the alive flag.
+			// ---------------------------------------------------------------
+			//
+			// ANIMALS_CONSCIOUS is the registry the game keys aliveness off.
+			// If generate-and-spawn leaves it unset, that is the obvious
+			// candidate for the third step the wave builder performs, and it is
+			// a struct write on a global rather than a call into an unproven
+			// routine - so it is cheap enough to test in the same press instead
+			// of costing another launch.
+			bool wrote_conscious = false;
+
+			if (enemies_spawned <= enemies_before && instances_spawned > instances_before)
+			{
+				const bool already_conscious =
+					conscious_after.has_value() && *conscious_after;
+
+				if (already_conscious)
+				{
+					SelfTestLog("    [4] the alive flag is already set, so that is "
+						"not what the wave is missing");
+				}
+				else if (!conscious_after.has_value())
+				{
+					SelfTestWarn("    [4] global.ANIMALS_CONSCIOUS could not be "
+						"read as a struct, so the alive flag cannot be tested "
+						"from here");
+				}
+				else
+				{
+					// The value is copied off an entry the game made rather
+					// than constructed here, so the flag this writes is the
+					// same kind the game writes. An empty registry offers
+					// nothing to copy, and inventing one is the move that has
+					// produced half-built state every time it was tried.
+					auto flag = RegistryAnyValue("ANIMALS_CONSCIOUS");
+
+					if (!flag)
+					{
+						SelfTestWarn("    [4] ANIMALS_CONSCIOUS holds no entry to "
+							"copy a flag value from, so there is nothing to "
+							"write that is known to be the right shape");
+					}
+					else
+					{
+						SelfTestLog("    [4] setting global.ANIMALS_CONSCIOUS"
+							"[\"%s\"] = %s (copied from an entry the game made) "
+							"and re-reading the count", key.c_str(),
+							DescribeValue(*flag).c_str());
+
+						wrote_conscious = RegistrySet("ANIMALS_CONSCIOUS", key,
+							*flag);
+					}
+
+					if (flag && !wrote_conscious)
+					{
+						SelfTestWarn("        the write did not go through - "
+							"variable_struct_set would not take it");
+					}
+					else if (wrote_conscious)
+					{
+						const int enemies_conscious =
+							ReadGlobalCount("NUM_ENEMIES_ACTIVE");
+
+						SelfTestLog("        NUM_ENEMIES_ACTIVE   %d -> %d%s",
+							enemies_spawned, enemies_conscious,
+							enemies_conscious > enemies_spawned
+								? "   <<< THE ALIVE FLAG IS THE MISSING STEP"
+								: "   (the flag is not what it was waiting for)");
+					}
+				}
+			}
+
+			// ---------------------------------------------------------------
+			// 5. Say what the next step is, from what was just measured.
+			// ---------------------------------------------------------------
+			//
+			// The point of batching is that the probe can name its own
+			// follow-up instead of the next session inferring one from a single
+			// number.
+			const int enemies_final = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
+
+			if (enemies_final > enemies_before)
+			{
+				SelfTestLog("    [5] the wave counts it. The duel becomes "
+					"ClearDefaultEnemyWave plus one animal_generate + "
+					"enemy_spawn pair per unit.");
+			}
+			else if (instances_spawned > instances_before)
+			{
+				SelfTestLog("    [5] the unit exists and the wave does not count "
+					"it. Registries at this point: ANIMALS %s, "
+					"ANIMALS_CONSCIOUS %s. The count is maintained somewhere "
+					"other than these two, so the next thing to find is what "
+					"writes NUM_ENEMIES_ACTIVE - the caller of enemy_spawn in "
+					"o_gameplay's Create event is the place to read.",
+					PresenceText(RegistryHasKey("ANIMALS", key)),
+					PresenceText(RegistryHasKey("ANIMALS_CONSCIOUS", key)));
+			}
+			else
+			{
+				SelfTestLog("    [5] nothing was created at all, so the argument "
+					"or the type namespace is wrong rather than the "
+					"registration. The descriptors' .id is the next thing to "
+					"feed animal_generate.");
+			}
+
+			// ---------------------------------------------------------------
+			// 6. Put the round back the way it was found.
+			// ---------------------------------------------------------------
+			if (g_InjectionPersist.load())
+			{
+				SelfTestWarn("    [6] injection_persist is on, so the unit is "
+					"being LEFT STANDING. Play the round out and report whether "
+					"it refuses to end while that enemy lives - that, and not "
+					"the counter, is what the duel needs. Turn this off again "
+					"afterwards.");
+
+				return Outcome::Answered;
+			}
+
+			if (instances_spawned > instances_before &&
 				spawned.m_Kind != VALUE_UNDEFINED)
 			{
 				bridge::CallBuiltin("instance_destroy", { spawned });
 			}
+
+			// Only what this probe added. A flag that was already set belongs
+			// to the game and is left alone.
+			if (wrote_conscious)
+				RegistryRemove("ANIMALS_CONSCIOUS", key);
 
 			if (bridge::ScriptExists("gml_Script_animal_delete"))
 			{
@@ -2011,9 +2915,48 @@ namespace hmd::roster
 				bridge::CallScript("gml_Script_animal_delete", { *id }, ignored);
 			}
 
-			SelfTestLog("    cleaned up: o_enemy instances now %d, "
-				"NUM_ENEMIES_ACTIVE now %d", CountEnemyInstances(),
-				ReadGlobalCount("NUM_ENEMIES_ACTIVE"));
+			const int instances_cleaned = CountEnemyInstances();
+			const int enemies_cleaned = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
+
+			SelfTestLog("    [6] destroyed the instance: o_enemy now %d, "
+				"NUM_ENEMIES_ACTIVE now %d", instances_cleaned, enemies_cleaned);
+
+			// The counter does not come back on its own, and a round whose
+			// counter never reaches zero never ends. This is the whole reason
+			// two runs froze.
+			if (enemies_cleaned != enemies_before && enemies_before >= 0)
+			{
+				SelfTestWarn("        the counter did NOT come back down - "
+					"instance_destroy does not decrement it. Restoring it to %d "
+					"so the round can still end.", enemies_before);
+
+				const bool restored =
+					RestoreGlobalCount("NUM_ENEMIES_ACTIVE", enemies_before);
+
+				const int enemies_final = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
+
+				SelfTestLog("        NUM_ENEMIES_ACTIVE %d -> %d%s",
+					enemies_cleaned, enemies_final,
+					enemies_final == enemies_before
+						? "   (restored)"
+						: "   <<< STILL WRONG - THIS ROUND WILL NOT END");
+
+				if (!restored || enemies_final != enemies_before)
+				{
+					SelfTestWarn("        THE ROUND COUNTER COULD NOT BE PUT "
+						"BACK. This round will not finish when its last enemy "
+						"dies. Abandon the run rather than playing it out.");
+				}
+			}
+
+			if (instances_cleaned > instances_before)
+			{
+				SelfTestWarn("        THE SPAWNED UNIT COULD NOT BE REMOVED. "
+					"Finish this run rather than continuing it - the round is "
+					"holding an enemy the mod put there.");
+			}
+
+			return Outcome::Answered;
 		}
 
 		// ------------------------------------------------------------------
@@ -2245,22 +3188,18 @@ namespace hmd::roster
 			return raw ? std::string(raw) : std::string{};
 		}
 
-		// Returns true when the candidate was reached and returned.
-		bool RunApplyCandidate(
+		Outcome RunApplyCandidate(
 			const ApplyCandidate& Candidate,
 			const std::string& Payload,
-			int Index,
-			int Last
+			const Arm& Arm
 		)
 		{
-			SelfTestLog("--- apply %d of %d: %s ---", Index, Last,
-				Candidate.script);
 			SelfTestLog("    %s", Candidate.what);
 
 			if (!bridge::ScriptExists(Candidate.script))
 			{
 				SelfTestWarn("    SKIPPED - this build has no such script");
-				return false;
+				return Outcome::Skipped;
 			}
 
 			// The player's clipboard is theirs. It is saved, borrowed and put
@@ -2274,7 +3213,7 @@ namespace hmd::roster
 				{
 					SelfTestWarn("    SKIPPED - no duel payload to place on the "
 						"clipboard");
-					return false;
+					return Outcome::Skipped;
 				}
 
 				borrowed = ReadClipboardText();
@@ -2294,10 +3233,7 @@ namespace hmd::roster
 			const int enemies_before = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
 			const int dudes_before = ReadGlobalCount("NUM_DUDES_ACTIVE");
 
-			MarkAttempted(ApplyMarkerPath(), Index);
-
-			SelfTestLog("    HANDED TO THE GAME - if the transcript ends here, "
-				"this candidate is the one that kills it");
+			Arm();
 
 			// Argument counts are not knowable on this build, so each candidate
 			// is called with none. A routine that needs one will say so in a
@@ -2306,12 +3242,10 @@ namespace hmd::roster
 			if (!bridge::CallScriptAnnounced(Candidate.script, {}, returned))
 			{
 				SelfTestWarn("    SKIPPED - the call could not be made");
-				ClearMarker(ApplyMarkerPath());
 				restore();
-				return false;
+				return Outcome::Skipped;
 			}
 
-			ClearMarker(ApplyMarkerPath());
 			restore();
 
 			const int enemies_after = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
@@ -2329,7 +3263,7 @@ namespace hmd::roster
 				enemies_before, enemies_after, dudes_before, dudes_after,
 				moved ? "   <<< THE ROUND CHANGED" : "   (no effect)");
 
-			return true;
+			return Outcome::Answered;
 		}
 	}
 
@@ -2382,6 +3316,20 @@ namespace hmd::roster
 			{ "hmd_obs_animal_generate",    "gml_Script_animal_generate",    nullptr },
 			{ "hmd_obs_animal_ctor",        "gml_Script_Animal",             nullptr },
 			{ "hmd_obs_animal_get",         "gml_Script_animal_get",         nullptr },
+
+			// The death path.
+			//
+			// enemy_spawn raises NUM_ENEMIES_ACTIVE and instance_destroy does
+			// not lower it, so the mod cannot yet remove a unit the way the
+			// game removes one - and a duel has to, because AbandonDuel must
+			// put the round back. These names came from the script table
+			// rather than from guessing, and watching the game kill its own
+			// enemies is how the signature gets learned. Same move that
+			// produced animal_generate.
+			{ "hmd_obs_animal_delete",      "gml_Script_animal_delete",      nullptr },
+			{ "hmd_obs_animals_clear",      "gml_Script_animals_clear",      nullptr },
+			{ "hmd_obs_hp_set",             "gml_Script_combatant_hp_set",   nullptr },
+			{ "hmd_obs_hp_change",          "gml_Script_combatant_hp_change", nullptr },
 		};
 
 		// One detour body per observer. They cannot share one function because a
@@ -2557,6 +3505,22 @@ namespace hmd::roster
 			g_SpawnObservers[6].hook_id, g_SpawnObservers[6].script,
 			&SpawnObserverDetour<6>);
 
+		g_SpawnObservers[7].trampoline = hooks::Install(Module,
+			g_SpawnObservers[7].hook_id, g_SpawnObservers[7].script,
+			&SpawnObserverDetour<7>);
+
+		g_SpawnObservers[8].trampoline = hooks::Install(Module,
+			g_SpawnObservers[8].hook_id, g_SpawnObservers[8].script,
+			&SpawnObserverDetour<8>);
+
+		g_SpawnObservers[9].trampoline = hooks::Install(Module,
+			g_SpawnObservers[9].hook_id, g_SpawnObservers[9].script,
+			&SpawnObserverDetour<9>);
+
+		g_SpawnObservers[10].trampoline = hooks::Install(Module,
+			g_SpawnObservers[10].hook_id, g_SpawnObservers[10].script,
+			&SpawnObserverDetour<10>);
+
 		int installed = 0;
 		for (const SpawnObserver& observer : g_SpawnObservers)
 		{
@@ -2583,145 +3547,225 @@ namespace hmd::roster
 		}
 	}
 
+	// Wrap a probe that takes nothing and cannot decline. Most of the read-only
+	// probes are shaped like that; the manifest is not a reason to change them.
+	//
+	// It arms before running. A Safe probe has nothing to fear from the
+	// journal, and journalling it is what catches the case where "safe" was a
+	// judgement rather than a fact: an entry attempted and never returned is
+	// skipped on the next launch with a message saying the classification was
+	// wrong, instead of killing every launch at the same line forever.
+	namespace
+	{
+		ProbeBody Always(void (*Probe)())
+		{
+			return [Probe](const Arm& arm)
+			{
+				arm();
+				Probe();
+				return Outcome::Answered;
+			};
+		}
+	}
+
+	void SetAllowSpawnProbes(bool Allow)
+	{
+		g_AllowSpawnProbes.store(Allow);
+
+		if (Allow)
+			LogWarn("allow_spawn_probes is ON - F5 will put a unit into the "
+				"live round. Both of these questions are already answered; "
+				"expect the round to be disturbed and do not use a run you "
+				"care about.");
+	}
+
+	void SetInjectionPersist(bool Persist)
+	{
+		g_InjectionPersist.store(Persist);
+
+		if (Persist)
+			LogWarn("injection_persist is ON - a successful injection probe will "
+				"leave a real extra enemy in the round it ran in. This is for "
+				"measuring whether the round waits for it; turn it off for "
+				"ordinary play.");
+	}
+
 	void SelfTestDuelPayload(bool RestartFromFirstStage)
 	{
-		SelfTestLog("=== duel payload self-test (staged) ===");
-
-		// Read the marker before anything writes one.
-		const int did_not_return = ReadStageThatDidNotReturn();
-		int first = 0;
+		SelfTestLog("=== self-test: the probe manifest ===");
 
 		if (RestartFromFirstStage)
 		{
-			ClearStageMarker();
-			SelfTestLog("shift was held - starting again from stage 0");
-		}
-		else if (did_not_return >= 0)
-		{
-			first = did_not_return + 1;
-			SelfTestLog("stage %d was attempted and never returned, so it is "
-				"what killed the game. Resuming at stage %d. Hold shift with F5 "
-				"to start over from 0.", did_not_return, first);
+			ProbeJournal().Clear();
+			SelfTestLog("shift was held - the journal is cleared and every "
+				"question is open again");
 		}
 
+		// The export is an input to several entries rather than an entry
+		// itself. It is taken once, here, so that every payload stage in this
+		// press is built from the same snapshot - a bisect whose stages differ
+		// in more than the thing under test measures nothing.
 		const std::string exported = CaptureGameNativeExport();
+
 		if (exported.empty())
 		{
-			SelfTestWarn("self-test: nothing exported - cannot continue");
-			return;
+			SelfTestWarn("nothing exported this press - the payload stages and "
+				"the apply candidates have no input and will be skipped. The "
+				"probes that do not need one still run.");
 		}
 
-		// Every remaining question about this format is a question about its
-		// values rather than its shape, and "scalar" does not distinguish a
-		// string from a number - which is how boss_fight_id hid for nine
-		// sessions.
-		SelfTestLog("self-test: the export, verbatim (%zu bytes)", exported.size());
-		LogTextInSlices("export", exported);
+		const std::vector<SelfTestStage> stages = exported.empty()
+			? std::vector<SelfTestStage>{}
+			: BuildSelfTestStages(exported);
 
-		DescribeMatchupExport(exported);
+		const std::string duel_payload = exported.empty()
+			? std::string{}
+			: BuildDuelPayload(exported);
 
-		if (!bridge::ScriptExists("gml_Script_custom_matchup_parse"))
-		{
-			SelfTestWarn("self-test: custom_matchup_parse does not exist - the "
-				"injection half of the duel has no route at all");
-			return;
-		}
+		std::vector<ProbeEntry> manifest;
 
-		const std::vector<SelfTestStage> stages = BuildSelfTestStages(exported);
-		if (stages.empty())
-		{
-			SelfTestWarn("self-test: no stages could be built from the export");
-			return;
-		}
-
-		const int last = static_cast<int>(stages.size()) - 1;
-
-		if (first > last)
-		{
-			SelfTestWarn("self-test: every stage has already been attempted. "
-				"Hold shift with F5 to run them again from 0.");
-			ClearStageMarker();
-			return;
-		}
-
-		SelfTestLog("self-test: %d stages, running %d through %d. Each one loads "
-			"a matchup, so the round is expected to change as this goes.",
-			static_cast<int>(stages.size()), first, last);
-
-		int reached = 0;
-		int skipped = 0;
-
-		for (int index = first; index <= last; index++)
-		{
-			if (RunSelfTestStage(stages[static_cast<size_t>(index)], index, last))
-				reached++;
-			else
-				skipped++;
-		}
-
-		// Skipped is not survived. A stage the mod refused to hand over says
-		// nothing about what the game would have done with it.
-		SelfTestLog("=== payload stages %d-%d: %d reached the game and survived, "
-			"%d never got that far ===", first, last, reached, skipped);
-
-		// ------------------------------------------------------------------
-		// Phase 2: find the routine that actually applies a parsed matchup.
-		// ------------------------------------------------------------------
+		// -------------------------------------------------------------------
+		// Safe: reads and enumerations. Every press, no launch budget spent.
+		// -------------------------------------------------------------------
 		//
-		// Every payload stage survives and none of them move
-		// NUM_ENEMIES_ACTIVE, so parsing is not applying and the format work is
-		// finished. This is the step that remains.
-		const std::string duel_payload = BuildDuelPayload(exported);
+		// These are first on purpose. A Fatal entry further down may end the
+		// process, and anything ordered after it would then be waiting on a
+		// relaunch to answer a question that never needed one. Several
+		// sessions were spent exactly that way.
+		manifest.push_back({
+			"export/describe",
+			"the export, verbatim and described",
+			Lethality::Safe,
+			[&exported](const Arm& arm)
+			{
+				if (exported.empty())
+					return Outcome::Skipped;
 
-		const int apply_did_not_return =
-			ReadIndexThatDidNotReturn(ApplyMarkerPath());
+				arm();
 
-		int first_apply = 0;
+				// Every remaining question about this format is about its
+				// values rather than its shape, and "scalar" does not
+				// distinguish a string from a number - which is how
+				// boss_fight_id hid for nine sessions.
+				SelfTestLog("    %zu bytes", exported.size());
+				LogTextInSlices("export", exported);
+				DescribeMatchupExport(exported);
 
-		if (RestartFromFirstStage)
+				return Outcome::Answered;
+			}
+		});
+
+		manifest.push_back({
+			"spawn/caller",
+			"what calls enemy_spawn?",
+			Lethality::Safe,
+			Always(&RunSpawnCallerProbe)
+		});
+
+		manifest.push_back({
+			"spawn/plan",
+			"which global holds the spawn id?",
+			Lethality::Safe,
+			Always(&RunSpawnPlanProbe)
+		});
+
+		manifest.push_back({
+			"scripts/names",
+			"what is the animal factory actually called?",
+			Lethality::Safe,
+			Always(&RunScriptNameProbe)
+		});
+
+		// -------------------------------------------------------------------
+		// Typed: a game call that has been measured, repeatedly, not to abort.
+		// -------------------------------------------------------------------
+		manifest.push_back({
+			"enemies/available",
+			"what may legally spawn in this round?",
+			Lethality::Typed,
+			Always(&RunAvailableEnemiesProbe)
+		});
+
+		// -------------------------------------------------------------------
+		// Fatal: one launch each, in order.
+		// -------------------------------------------------------------------
+		//
+		// The open question goes FIRST.
+		//
+		// Everything else in this group is answered: nine payload stages that
+		// survive and move nothing, four apply candidates that do the same. Put
+		// ahead of the injection probe they cost a press and risk a round -
+		// each surviving stage loads a matchup into the live round and that
+		// state accumulates - to re-learn what fifteen earlier parses already
+		// established. Ordering by what is still unknown rather than by the
+		// sequence they were written in is the whole point of a manifest.
+		if (g_AllowSpawnProbes.load())
 		{
-			ClearMarker(ApplyMarkerPath());
-		}
-		else if (apply_did_not_return >= 0)
-		{
-			first_apply = apply_did_not_return + 1;
-			SelfTestLog("apply candidate %d was attempted and never returned, so "
-				"it is what killed the game. Resuming at %d.",
-				apply_did_not_return, first_apply);
-		}
-
-		const int last_apply =
-			static_cast<int>(std::size(kApplyCandidates)) - 1;
-
-		if (first_apply > last_apply)
-		{
-			SelfTestWarn("=== every apply candidate has been attempted; skipping "
-				"to the direct spawn probe. Hold shift with F5 to run them "
-				"again from the first ===");
+			manifest.push_back({
+				"injection/generate-spawn",
+				"animal_generate + enemy_spawn, and what the wave does about it",
+				Lethality::Fatal,
+				[](const Arm& arm) { return RunRealInjectionProbe(arm); }
+			});
 		}
 		else
 		{
-			SelfTestLog("=== apply probe: which routine makes a parsed matchup "
-				"take effect? Running %d through %d ===", first_apply, last_apply);
-
-			for (int index = first_apply; index <= last_apply; index++)
-			{
-				RunApplyCandidate(kApplyCandidates[static_cast<size_t>(index)],
-					duel_payload, index, last_apply);
-			}
+			SelfTestLog("--- injection/generate-spawn is SETTLED and not run. "
+				"animal_generate + enemy_spawn increments NUM_ENEMIES_ACTIVE - "
+				"measured 6->7 and 10->11 on two builds. Set "
+				"allow_spawn_probes = true in the ini to run it again, and "
+				"expect it to disturb the round it runs in ---");
 		}
 
-		// Phase 3 runs regardless. It does not depend on anything the matchup
-		// routines did, and it is the route that does not need them.
-		RunDirectSpawnProbe();
+		for (size_t index = 0; index < stages.size(); index++)
+		{
+			const SelfTestStage& stage = stages[index];
 
-		// Ordered after the spawn probe so that if the spawn kills the game,
-		// this still runs on the next press once the marker skips that code.
-		RunAvailableEnemiesProbe();
-		RunSpawnCallerProbe();
-		RunSpawnPlanProbe();
-		RunScriptNameProbe();
-		RunRealInjectionProbe();
+			// The id carries the stage's own name rather than only its
+			// position, so inserting a stage does not silently reassign an
+			// answer already on record.
+			manifest.push_back({
+				"payload/" + std::to_string(index) + "-" + stage.name,
+				"payload stage: " + stage.name,
+				Lethality::Fatal,
+				[&stage](const Arm& arm)
+				{
+					if (!bridge::ScriptExists("gml_Script_custom_matchup_parse"))
+					{
+						SelfTestWarn("    SKIPPED - custom_matchup_parse does "
+							"not exist on this build");
+						return Outcome::Skipped;
+					}
+
+					return RunSelfTestStage(stage, arm);
+				}
+			});
+		}
+
+		for (const ApplyCandidate& candidate : kApplyCandidates)
+		{
+			manifest.push_back({
+				std::string("apply/") + candidate.script,
+				std::string("apply candidate: ") + candidate.script,
+				Lethality::Fatal,
+				[&candidate, &duel_payload](const Arm& arm)
+				{
+					return RunApplyCandidate(candidate, duel_payload, arm);
+				}
+			});
+		}
+
+		if (g_AllowSpawnProbes.load())
+		{
+			manifest.push_back({
+				"spawn/direct",
+				"call the game's own enemy_spawn with a harvested code",
+				Lethality::Fatal,
+				[](const Arm& arm) { return RunDirectSpawnProbe(arm); }
+			});
+		}
+
+		RunManifest(manifest);
 
 		SelfTestLog("=== end of self-test ===");
 	}
@@ -2926,126 +3970,213 @@ namespace hmd::roster
 		g_EnemiesCleared.store(0);
 	}
 
+	// Spawn the peer's army using the two calls the game uses on itself.
+	//
+	//     record = animal_generate(enemy_type)   registers itself in ANIMALS,
+	//                                            with its alive flag
+	//     enemy_spawn(record.id, x, y)           the counted, fightable instance
+	//
+	// Measured twice before this was written, on two builds and two types:
+	// NUM_ENEMIES_ACTIVE 6->7 and 10->11. Nothing here is a guess, and nothing
+	// is invented - stats, callbacks and sprites all come from the game's own
+	// construction.
+	//
+	// Both previous routes are gone and neither should come back:
+	//
+	//   - custom_matchup_parse parses and does not apply. Fifteen successful
+	//     parses moved NUM_ENEMIES_ACTIVE by zero, including one asking for a
+	//     single enemy in a round holding ten.
+	//   - instance_create_depth on o_enemy plus attribute writes produced
+	//     half-built units. Per-instance member writes are impossible on this
+	//     build (six attempts), so every write silently did nothing, and
+	//     enemies are not objects anyway - they share one object and carry a
+	//     type through their ANIMALS record.
 	int InjectOpponentArmy(const Snapshot& Peer)
 	{
-		// Preferred path: hand the peer's payload to the game's own importer,
-		// which validates and spawns using engine-native logic.
-		//
-		// Snapshot::Deserialize has already structure-checked this string, but
-		// it is re-checked here because this is the exact point where peer bytes
-		// cross out of the mod and into the game's own parser. That parser was
-		// written for text a player pastes in, and it is the only part of this
-		// path we do not control - so the check sits at the boundary rather than
-		// only at the point of receipt.
-		if (!Peer.matchup.empty() &&
-			sanitize::IsMatchupPayload(Peer.matchup) &&
-			bridge::ScriptExists("gml_Script_custom_matchup_parse"))
+		if (!bridge::ScriptExists("gml_Script_animal_generate") ||
+			!bridge::ScriptExists("gml_Script_enemy_spawn"))
 		{
-			// Struct, not text. Handing the string straight over dies inside
-			// struct_merge_shallow - see ParseJsonToStruct. The structural check
-			// above still runs on the TEXT, before any of it reaches the game,
-			// which is where a peer-supplied payload should be judged.
-			auto as_struct = ParseJsonToStruct(Peer.matchup);
-
-			RValue parsed;
-			if (as_struct &&
-				bridge::CallScriptAnnounced(
-					"gml_Script_custom_matchup_parse",
-					{ *as_struct },
-					parsed) &&
-				parsed.m_Kind != VALUE_UNDEFINED)
-			{
-				LogStage(kStageInject,
-					"peer army handed to the game's own matchup parser");
-				return static_cast<int>(Peer.units.size());
-			}
-
-			LogWarn("native matchup parse rejected the peer payload - falling "
-				"back to per-unit spawning");
-		}
-
-		// Fallback path: spawn each unit directly as an o_enemy and stamp the
-		// serialised attributes onto it.
-		int object_index = bridge::AssetIndex("o_enemy");
-		if (object_index < 0)
-		{
-			LogError("o_enemy is not a known object - cannot inject opponent army");
+			LogError("animal_generate or enemy_spawn is missing on this build - "
+				"the opponent's army cannot be spawned");
 			return 0;
 		}
 
-		int spawned = 0;
-		for (const Unit& unit : Peer.units)
+		// The army is the enemies map of the peer's payload: type name to
+		// count. BuildDuelPayload has already translated the sender's dudes
+		// into enemy type names, so what arrives is already "fight this".
+		//
+		// Peer.units is not used. It is the per-instance representation, and
+		// per-instance reads are dead on this build - the counts are the army.
+		json::Value root;
+		if (Peer.matchup.empty() || !json::Parse(Peer.matchup, root) ||
+			!root.IsObject())
 		{
-			// Knocked-out units do not join the opposing wave.
-			if (unit.knocked_out)
-				continue;
-
-			// Mirror the unit across the arena so the peer's army arrives on
-			// the opposing side rather than on top of the local roster.
-			double spawn_x = -unit.x;
-			double spawn_y = unit.y;
-
-			auto created = bridge::CallBuiltin(
-				"instance_create_depth",
-				{
-					RValue(spawn_x),
-					RValue(spawn_y),
-					RValue(0.0),
-					RValue(static_cast<double>(object_index))
-				}
-			);
-
-			if (!created || created->m_Kind == VALUE_UNDEFINED)
-			{
-				LogWarn("failed to create o_enemy for peer unit '%s'",
-					unit.type.c_str());
-				continue;
-			}
-
-			// instance_create_depth returns a VALUE_REF on this runner, exactly
-			// as instance_find does, and a ref cannot be written to. Without
-			// this the spawn succeeds and every single attribute write below
-			// silently does nothing - an arena full of default enemies that
-			// look like the peer's army and are not.
-			RValue target;
-			if (!bridge::AsInstance(*created, target))
-			{
-				static bool warned = false;
-				if (!warned)
-				{
-					warned = true;
-					LogWarn("spawned enemies cannot be resolved to instances - "
-						"the opponent's army will arrive with default stats");
-				}
-
-				spawned++;
-				continue;
-			}
-
-			// Best-effort attribute transfer. Each write is independent: a
-			// member the runtime does not expose is skipped, not fatal.
-			auto write = [&](const char* logical, double value)
-			{
-				const std::string* member = ResolveField(target, logical);
-				if (member)
-					bridge::SetMember(target, *member, RValue(value));
-			};
-
-			write("level", unit.level);
-			write("max_hp", unit.max_hp);
-			write("hp", unit.hp > 0.0 ? unit.hp : unit.max_hp);
-			write("attack", unit.attack);
-			write("speed", unit.speed);
-			write("range", unit.range);
-			write("crit_chance", unit.crit_chance);
-			write("crit_damage", unit.crit_damage);
-
-			spawned++;
+			LogError("the peer's payload could not be read as a matchup - "
+				"nothing to spawn");
+			return 0;
 		}
 
-		LogStage(kStageInject, "spawned %d/%zu peer unit(s) as the opponent wave",
-			spawned, Peer.units.size());
+		const json::Value& enemies = root["enemies"];
+		if (!enemies.IsObject() || enemies.Members().empty())
+		{
+			LogError("the peer's payload names no enemies - nothing to spawn");
+			return 0;
+		}
+
+		// The value removal has to get back to. Taken after
+		// ClearDefaultEnemyWave has run, so it is the count of whatever the
+		// round legitimately still holds.
+		g_Injected.clear();
+		g_EnemiesBeforeInjection = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
+
+		const std::vector<SpawnPosition> positions = InjectionPositions();
+
+		int spawned = 0;
+		size_t position = 0;
+
+		for (const auto& [type, count] : enemies.Members())
+		{
+			const double raw = count.AsNumber();
+			if (!std::isfinite(raw) || raw <= 0.0)
+				continue;
+
+			// Bounded per type. A peer is not trusted to size our arena, and a
+			// count that arrives absurd should cost a small wave rather than a
+			// hung game.
+			// Parenthesised: Windows.h defines a min macro, and this file
+			// includes it for the module-path and timestamp helpers.
+			const int wanted = (std::min)(static_cast<int>(raw), kMaxUnitsPerType);
+
+			for (int i = 0; i < wanted; i++)
+			{
+				const SpawnPosition where = positions[position % positions.size()];
+				position++;
+
+				if (SpawnOneInjectedUnit(type, where.x, where.y))
+					spawned++;
+			}
+		}
+
+		LogStage(kStageInject, "spawned %d unit(s) as the opponent wave; "
+			"NUM_ENEMIES_ACTIVE is now %d", spawned,
+			ReadGlobalCount("NUM_ENEMIES_ACTIVE"));
+
+		if (spawned == 0)
+			LogError("not one unit of the opponent's army could be spawned");
 
 		return spawned;
+	}
+
+	// Take the injected wave back out, and leave the round able to end.
+	//
+	// This is the hard half. Spawning is two calls that the game itself makes;
+	// un-spawning is not, because `enemy_spawn` INCREMENTS NUM_ENEMIES_ACTIVE
+	// and `instance_destroy` does NOT decrement it - the game does that on its
+	// own death path, which destroying an instance walks straight past. One
+	// leaked count and the round waits forever for an enemy that is not there.
+	// Two runs froze exactly that way before it was understood.
+	//
+	// The proper fix is to kill each unit the way the game kills it. That
+	// routine is not identified yet, so this does three things in order and
+	// MEASURES each one, which turns ordinary use into the experiment:
+	//
+	//   1. animal_delete(key) while the instance is still alive. The earlier
+	//      probe called this only AFTER instance_destroy, so "animal_delete
+	//      does not decrement" was never actually tested - only "it does not
+	//      decrement once the instance is already gone". If the counter moves
+	//      here, the death path is a routine the mod already calls, and the log
+	//      will say so in capitals.
+	//   2. instance_destroy for whatever is left.
+	//   3. restore the counter by hand if it is still wrong.
+	//
+	// Step 3 is a patch and is meant to read as one. It is correct - the target
+	// value is measured, not computed - but a duel that depends on putting a
+	// global back by hand is one bug away from a run that cannot finish, which
+	// is why steps 1 and 2 report what they achieved on their own.
+	int RemoveInjectedWave()
+	{
+		if (g_Injected.empty())
+			return 0;
+
+		const int before = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
+		const bool can_delete = bridge::ScriptExists("gml_Script_animal_delete");
+
+		int deleted = 0;
+		int destroyed = 0;
+		int counter_moved_by_delete = 0;
+
+		for (const InjectedUnit& unit : g_Injected)
+		{
+			// 1. The record first, while its instance still exists.
+			if (can_delete)
+			{
+				const int at_start = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
+
+				RValue ignored;
+				if (bridge::CallScript("gml_Script_animal_delete",
+						{ RValue(unit.key) }, ignored))
+					deleted++;
+
+				const int after_delete = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
+
+				if (after_delete >= 0 && at_start >= 0 && after_delete < at_start)
+					counter_moved_by_delete++;
+			}
+
+			// 2. Then whatever instance remains.
+			if (unit.instance.m_Kind != VALUE_UNDEFINED &&
+				bridge::CallBuiltin("instance_destroy", { unit.instance }))
+				destroyed++;
+		}
+
+		const int after = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
+
+		LogStage(kStageInject, "removed the injected wave: %zu unit(s), "
+			"%d record(s) deleted, %d instance(s) destroyed; "
+			"NUM_ENEMIES_ACTIVE %d -> %d", g_Injected.size(), deleted,
+			destroyed, before, after);
+
+		// The finding this routine exists to produce.
+		if (counter_moved_by_delete > 0)
+		{
+			LogInfo("DEATH PATH FOUND: animal_delete decremented "
+				"NUM_ENEMIES_ACTIVE for %d of %zu unit(s) when called BEFORE "
+				"instance_destroy. That is the game's own bookkeeping, and the "
+				"hand-restore below should be unnecessary - record this.",
+				counter_moved_by_delete, g_Injected.size());
+		}
+		else if (can_delete)
+		{
+			LogInfo("animal_delete did not move NUM_ENEMIES_ACTIVE even called "
+				"before instance_destroy, so the death path is elsewhere. "
+				"combatant_hp_set is the next candidate; its signature is not "
+				"known.");
+		}
+
+		const int removed = static_cast<int>(g_Injected.size());
+		g_Injected.clear();
+
+		// 3. Whatever the game did not undo itself.
+		if (g_EnemiesBeforeInjection >= 0 && after != g_EnemiesBeforeInjection)
+		{
+			LogWarn("the enemy counter did not come back on its own (%d, wanted "
+				"%d) - restoring it so this round can still end",
+				after, g_EnemiesBeforeInjection);
+
+			RestoreGlobalCount("NUM_ENEMIES_ACTIVE", g_EnemiesBeforeInjection);
+
+			const int final_count = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
+
+			if (final_count != g_EnemiesBeforeInjection)
+			{
+				LogError("NUM_ENEMIES_ACTIVE IS %d AND SHOULD BE %d. This round "
+					"will not finish when its last enemy dies. The run cannot "
+					"be completed - restart it.", final_count,
+					g_EnemiesBeforeInjection);
+			}
+		}
+
+		g_EnemiesBeforeInjection = -1;
+		return removed;
 	}
 }

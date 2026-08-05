@@ -74,6 +74,16 @@ namespace
 		// Show the mod's messages on screen through the game's own info
 		// stream. Turning this off falls back to log-only.
 		bool on_screen_messages = true;
+
+		// Leave a successful injection probe's unit standing. Diagnostic, off
+		// by default, and it changes the difficulty of the run it fires in.
+		// See roster::SetInjectionPersist.
+		bool injection_persist = false;
+
+		// Allow the two F5 probes that spawn a unit into the live round.
+		// Off by default; both questions are settled and asking again costs a
+		// round. See roster::SetAllowSpawnProbes.
+		bool allow_spawn_probes = false;
 	};
 
 	Config g_Config;
@@ -181,7 +191,25 @@ namespace
 			"; Show the mod's messages on screen using the game's own message\n"
 			"; stream. Turn off if it misbehaves - everything the mod says\n"
 			"; still goes to aurie.log either way.\n"
-			"on_screen_messages = true\n";
+			"on_screen_messages = true\n"
+			"\n"
+			"; DIAGNOSTIC. Leave this off for ordinary play.\n"
+			"; The F5 injection probe normally destroys the enemy it creates,\n"
+			"; so pressing it cannot change the difficulty of your run. With\n"
+			"; this on it leaves that enemy standing, which is the only way to\n"
+			"; see whether the round refuses to end while it lives - the thing\n"
+			"; a duel actually needs, and something the enemy counter cannot\n"
+			"; answer on its own. Costs one run to measure.\n"
+			"injection_persist = false\n"
+			"\n"
+			"; DIAGNOSTIC. Leave this off for ordinary play.\n"
+			"; Lets F5 spawn a unit into the round you are standing in. Both\n"
+			"; questions these probes ask are already answered, and spawning\n"
+			"; is the easy half: enemy_spawn raises the enemy counter and\n"
+			"; destroying the instance does not lower it, so the mod has to put\n"
+			"; the counter back by hand. If that restore ever fails, the round\n"
+			"; will not end when its last enemy dies.\n"
+			"allow_spawn_probes = false\n";
 
 		hmd::LogInfo("wrote a default config to %s", ConfigPath.string().c_str());
 	}
@@ -232,6 +260,14 @@ namespace
 		else if (Key == "on_screen_messages")
 		{
 			g_Config.on_screen_messages = (Value == "1" || Value == "true");
+		}
+		else if (Key == "injection_persist")
+		{
+			g_Config.injection_persist = (Value == "1" || Value == "true");
+		}
+		else if (Key == "allow_spawn_probes")
+		{
+			g_Config.allow_spawn_probes = (Value == "1" || Value == "true");
 		}
 	}
 
@@ -300,6 +336,10 @@ namespace
 			g_Config.auto_join ? 1 : 0,
 			g_Config.duel_interval,
 			g_Config.sync_run_start ? 1 : 0);
+
+		if (g_Config.injection_persist)
+			hmd::LogWarn("config: injection_persist is ON - the F5 injection "
+				"probe will leave what it spawns in the round");
 	}
 
 	// Joining is either discovery-driven or address-driven, and both hotkeys
@@ -771,6 +811,8 @@ EXPORTED AurieStatus ModuleInitialize(
 	hmd::runstate::Initialize(Module);
 	hmd::ui::Initialize(Module);
 	hmd::ui::SetNotificationsEnabled(g_Config.on_screen_messages);
+	hmd::roster::SetInjectionPersist(g_Config.injection_persist);
+	hmd::roster::SetAllowSpawnProbes(g_Config.allow_spawn_probes);
 
 	hmd::match::SetSyncRunStart(g_Config.sync_run_start);
 

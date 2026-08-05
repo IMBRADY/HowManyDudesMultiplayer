@@ -65,3 +65,17 @@ sync_run_start = true
 ; Turn off if it misbehaves. Everything the mod says still goes to aurie.log
 ; either way, and F8 still prints a status line.
 on_screen_messages = true
+
+; DIAGNOSTIC. Leave this off unless you are deliberately measuring with it.
+;
+; The F5 injection probe creates one enemy using the game's own routines and
+; then destroys it, so pressing F5 cannot change the difficulty of your run.
+;
+; That cleanup also hides the one thing the probe most needs to know. Its
+; success signal is the enemy counter going up, and a counter is not the same
+; question as "will the round refuse to end while this thing is alive" - which
+; is what a duel actually depends on. With this on, the probe leaves the enemy
+; standing so that question can be answered by playing the round out.
+;
+; The cost is a real extra enemy in that run. Turn it back off afterwards.
+injection_persist = false
