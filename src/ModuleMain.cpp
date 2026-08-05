@@ -456,7 +456,11 @@ namespace
 			}
 			else
 			{
-				hmd::roster::SelfTestDuelPayload();
+				// Held, not pressed: the self-test resumes past whichever stage
+				// killed the game last time, and shift is how you ask for the
+				// whole sequence again instead.
+				const bool restart = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+				hmd::roster::SelfTestDuelPayload(restart);
 			}
 		}
 	}
@@ -770,6 +774,11 @@ EXPORTED AurieStatus ModuleInitialize(
 
 	hmd::match::SetSyncRunStart(g_Config.sync_run_start);
 
+	// Observational only, and optional. These watch the game spawn its own
+	// enemies so the mod can learn a signature YYC stripped, rather than
+	// guessing one at a launch per guess.
+	hmd::roster::InstallSpawnObservers(Module);
+
 	if (!hmd::match::Initialize(Module))
 	{
 		hmd::LogError("match subsystem failed to start");
@@ -793,7 +802,8 @@ EXPORTED AurieStatus ModuleInitialize(
 	{
 		hmd::LogError("could not register the code callback (status %d) - "
 			"the mod cannot run", static_cast<int>(status));
-		hmd::match::Shutdown(Module);
+		hmd::roster::RemoveSpawnObservers(Module);
+	hmd::match::Shutdown(Module);
 		hmd::ui::Shutdown(Module);
 		hmd::runstate::Shutdown(Module);
 		hmd::steam::Shutdown();
@@ -840,6 +850,7 @@ EXPORTED AurieStatus ModuleUnload(
 
 	hmd::LogInfo("unloading");
 
+	hmd::roster::RemoveSpawnObservers(Module);
 	hmd::match::Shutdown(Module);
 	hmd::ui::Shutdown(Module);
 	hmd::runstate::Shutdown(Module);

@@ -133,6 +133,17 @@ namespace hmd::bridge
 	// place and finds nothing on this runner.
 	std::vector<YYTK::RValue> FindInstances(const std::string& ObjectName);
 
+	// Every member name on the global instance, minus the runtime's own noise.
+	//
+	// EnumInstanceMembers works on the global instance - it is ordinary
+	// instances it returns nothing for - so this is the one place the mod can
+	// enumerate rather than guess names. The anonymous struct closures
+	// ("___struct___1234") and the script table are filtered out; they number in
+	// the thousands and are never what anyone is looking for.
+	//
+	// Bounded. Returns an empty vector if the global instance is unavailable.
+	std::vector<std::string> GlobalMemberNames(size_t Limit = 4096);
+
 	// Resolve any instance-shaped RValue into one members can be written to.
 	//
 	// Needed because every builtin that hands back an instance on this runner -

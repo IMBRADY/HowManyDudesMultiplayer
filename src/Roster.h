@@ -18,6 +18,8 @@
 //
 #include "Json.h"
 
+#include <Aurie/shared.hpp>
+
 #include <string>
 #include <vector>
 
@@ -57,6 +59,22 @@ namespace hmd::roster
 		static bool Deserialize(const std::string& Text, Snapshot& Out);
 	};
 
+	// Install observational detours on the game's own spawn routines.
+	//
+	// Purely passive: each detour logs the arguments the game passed the first
+	// time it sees them and calls straight through. Nothing is altered.
+	//
+	// This exists because every other route is now closed. Enemy types are not
+	// objects (asset_get_index finds nothing under any prefix), and every
+	// custom-matchup routine parses without touching a live round. What is left
+	// is the routine the game itself uses to put an enemy in a wave - and the
+	// way to learn how to call it is to watch the game call it.
+	//
+	// Losing these costs a discovery, not the mod. A null trampoline is logged
+	// and ignored.
+	bool InstallSpawnObservers(Aurie::AurieModule* Module);
+	void RemoveSpawnObservers(Aurie::AurieModule* Module);
+
 	// Turn a native round export into what the opponent should fight: our dudes
 	// moved into their enemies slot, our dudes cleared so they keep their own,
 	// and the sender's boss dropped because a duel replaces it.
@@ -65,14 +83,19 @@ namespace hmd::roster
 	// translation. Empty string if the export cannot be transformed.
 	std::string BuildDuelPayload(const std::string& Export);
 
-	// Export the current round, transform it, and feed it to the game's own
-	// parser on this machine.
+	// Export the current round, then feed it to the game's own parser one
+	// change at a time, on this machine.
 	//
-	// The entire duel data path, end to end, on one machine. It answers the one
-	// question the format cannot: whether a dude type name means anything in the
-	// enemies map, or whether the two are separate namespaces. Worth doing
-	// before two people spend another session finding out.
-	void SelfTestDuelPayload();
+	// The single-payload version of this established that custom_matchup_parse
+	// accepts the struct and then dies in matchup_calculate_difficulty_score.
+	// It could not say which of the transform's four changes caused that, so
+	// this runs them as separate stages against one export snapshot.
+	//
+	// A stage that kills the game is the result. The marker file next to the
+	// DLL records which stage was in flight, so the next press resumes past it
+	// rather than dying in the same place; RestartFromFirstStage ignores the
+	// marker and runs the whole sequence again.
+	void SelfTestDuelPayload(bool RestartFromFirstStage);
 
 	// Run the game's own matchup exporter and report what it produced, without
 	// sending anything anywhere.

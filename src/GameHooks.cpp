@@ -4,6 +4,7 @@
 #include "GameBridge.h"
 #include "Log.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <set>
@@ -88,6 +89,99 @@ namespace hmd::hooks
 		}
 
 		return probe.entry;
+	}
+
+	std::string OwningScriptName(const void* Address, size_t& OutOffset)
+	{
+		OutOffset = 0;
+
+		if (!Address || !hmd::g_Interface)
+			return {};
+
+		const uintptr_t target = reinterpret_cast<uintptr_t>(Address);
+
+		std::string best_name;
+		uintptr_t best_entry = 0;
+
+		// Script ids are dense from 0 and the table ends when GetScriptData
+		// stops succeeding. The ceiling is a guard against a runner that
+		// reports success forever rather than an expectation about the game.
+		constexpr int kMaxScriptId = 20000;
+
+		for (int id = 0; id < kMaxScriptId; id++)
+		{
+			CScript* script = nullptr;
+			if (!AurieSuccess(hmd::g_Interface->GetScriptData(id, script)) || !script)
+				continue;
+
+			ScriptProbe probe = ProbeScript(script);
+			if (probe.faulted || !probe.name || !probe.entry)
+				continue;
+
+			const uintptr_t entry = reinterpret_cast<uintptr_t>(probe.entry);
+
+			// The owner is the closest entry point at or below the address.
+			if (entry <= target && entry > best_entry)
+			{
+				best_entry = entry;
+				best_name = probe.name;
+			}
+		}
+
+		if (best_entry == 0)
+			return {};
+
+		OutOffset = static_cast<size_t>(target - best_entry);
+		return best_name;
+	}
+
+	std::vector<std::string> ScriptNamesContaining(
+		const std::string& Fragment,
+		size_t Limit
+	)
+	{
+		std::vector<std::string> found;
+
+		if (!hmd::g_Interface || Fragment.empty())
+			return found;
+
+		std::string needle = Fragment;
+		std::transform(needle.begin(), needle.end(), needle.begin(),
+			[](unsigned char c) { return static_cast<char>(tolower(c)); });
+
+		constexpr int kMaxScriptId = 20000;
+
+		for (int id = 0; id < kMaxScriptId && found.size() < Limit; id++)
+		{
+			CScript* script = nullptr;
+			if (!AurieSuccess(hmd::g_Interface->GetScriptData(id, script)) || !script)
+				continue;
+
+			ScriptProbe probe = ProbeScript(script);
+			if (probe.faulted || !probe.name)
+				continue;
+
+			std::string name = probe.name;
+
+			// The runtime's anonymous struct closures - "___struct___187@..."
+			// and the "anon@933@..." chains - number in the thousands and are
+			// never what anyone is searching for. Left in, they spend the whole
+			// result limit before a single name a developer chose appears, which
+			// is exactly how the globals dump was worthless the first time it
+			// was needed.
+			if (name.find("___struct___") != std::string::npos ||
+				name.find("anon@") != std::string::npos)
+				continue;
+
+			std::string lowered = name;
+			std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+				[](unsigned char c) { return static_cast<char>(tolower(c)); });
+
+			if (lowered.find(needle) != std::string::npos)
+				found.push_back(std::move(name));
+		}
+
+		return found;
 	}
 
 	PFUNC_YYGMLScript Install(

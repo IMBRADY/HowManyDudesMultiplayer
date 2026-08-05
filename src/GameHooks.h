@@ -22,6 +22,7 @@
 #include <YYToolkit/YYTK_Shared.hpp>
 
 #include <string>
+#include <vector>
 
 namespace hmd::hooks
 {
@@ -46,6 +47,36 @@ namespace hmd::hooks
 	// Remove a hook installed by Install. Safe to call for an id that was never
 	// installed.
 	void Remove(Aurie::AurieModule* Module, const char* HookId);
+
+	// Name the script whose native code contains an address.
+	//
+	// GetScriptData walks the runner's whole script table by id, so every
+	// script's name and YYC entry point can be listed without knowing any name
+	// in advance. Given a return address captured inside a detour, the owning
+	// script is the one with the greatest entry point at or below it.
+	//
+	// This is how "what calls enemy_spawn?" gets answered. YYC left no call
+	// graph and discovered_mappings.json is a list of guesses; the return
+	// address is the fact.
+	//
+	// Returns an empty string when nothing plausible owns the address, and
+	// writes the offset into the winner when one is found. Read-only: it
+	// resolves and compares pointers, and calls none of them.
+	std::string OwningScriptName(const void* Address, size_t& OutOffset);
+
+	// Every script whose name contains Fragment, case-insensitively.
+	//
+	// The same table walk as OwningScriptName, used for the other thing YYC took
+	// away: the ability to find out what a routine is actually called. Every
+	// name this project has tried to use came from discovered_mappings.json,
+	// which is a list of plausible guesses - 'enemy_wave_spawner' does not exist
+	// and cost several sessions to stop believing in.
+	//
+	// Read-only. It reads names and calls nothing.
+	std::vector<std::string> ScriptNamesContaining(
+		const std::string& Fragment,
+		size_t Limit = 60
+	);
 
 	// --- Argument helpers -------------------------------------------------
 	//

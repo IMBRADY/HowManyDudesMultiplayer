@@ -431,6 +431,45 @@ namespace hmd::bridge
 		return instance;
 	}
 
+	std::vector<std::string> GlobalMemberNames(size_t Limit)
+	{
+		std::vector<std::string> names;
+
+		if (!g_Api)
+			return names;
+
+		CInstance* global = GlobalInstance();
+		if (!global)
+			return names;
+
+		const RValue global_value(global);
+
+		g_Api->EnumInstanceMembers(
+			global_value,
+			[&names, Limit](const char* MemberName, RValue* Value) -> bool
+			{
+				(void)Value;
+
+				if (!MemberName)
+					return false;
+
+				// Returning true STOPS the enumeration - the callback is a
+				// search predicate, not a "keep going" flag.
+				if (names.size() >= Limit)
+					return true;
+
+				if (strncmp(MemberName, "___struct___", 12) == 0 ||
+					strncmp(MemberName, "gml_Script_", 11) == 0)
+					return false;
+
+				names.push_back(MemberName);
+				return false;
+			}
+		);
+
+		return names;
+	}
+
 	std::optional<RValue> GetGlobal(const std::string& Name)
 	{
 		CInstance* global = GlobalInstance();
