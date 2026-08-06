@@ -84,6 +84,14 @@ namespace
 		// Off by default; both questions are settled and asking again costs a
 		// round. See roster::SetAllowSpawnProbes.
 		bool allow_spawn_probes = false;
+
+		// Fight a synthetic army on F4, with no peer, through the real duel
+		// path. Off by default - this is a test harness, and leaving it on
+		// during a real match only risks confusion. See match::SetSoloDuel.
+		bool solo_duel = false;
+
+		// What that army is: "type:count" pairs, comma separated.
+		std::string solo_duel_army = "basic:2";
 	};
 
 	Config g_Config;
@@ -113,6 +121,11 @@ namespace
 	// disturb the round the player is standing in. Diagnostics should be free
 	// to press; this one is not, so it is not bundled with the ones that are.
 	constexpr int kKeySelfTest = VK_F5;
+
+	// Start a solo duel: fight a synthetic army through the real duel path,
+	// with no peer. Does nothing unless solo_duel = true in the ini, which is
+	// how the whole feature is turned off again for real multiplayer.
+	constexpr int kKeySoloDuel = VK_F4;
 
 	bool WasKeyPressed(int VirtualKey)
 	{
@@ -209,7 +222,27 @@ namespace
 			"; destroying the instance does not lower it, so the mod has to put\n"
 			"; the counter back by hand. If that restore ever fails, the round\n"
 			"; will not end when its last enemy dies.\n"
-			"allow_spawn_probes = false\n";
+			"allow_spawn_probes = false\n"
+			"\n"
+			"; TEST HARNESS. Off for ordinary play, and off is the default.\n"
+			"; With this on, F4 fights a synthetic army with no peer connected,\n"
+			"; through the REAL duel path - the same clear, injection, spawn,\n"
+			"; counter corrections, battle evaluation and wave removal a real\n"
+			"; duel uses. Only the socket is absent.\n"
+			";\n"
+			"; It exists so duel bugs can be reproduced on one machine instead\n"
+			"; of costing a session with a second player. Practice costs no\n"
+			"; lives, cannot end your match, and sends nothing over the wire.\n"
+			";\n"
+			"; F4 refuses while a peer is connected, so this cannot disturb a\n"
+			"; real opponent. Set it back to false to go back to multiplayer.\n"
+			"solo_duel = false\n"
+			"\n"
+			"; The army F4 fights: 'type:count' pairs, comma separated. Types\n"
+			"; are DUDE type names as they appear in an export - basic,\n"
+			"; quantum, and so on - not enemy names. A type this build does not\n"
+			"; have is reported and skipped rather than spawned.\n"
+			"solo_duel_army = basic:2\n";
 
 		hmd::LogInfo("wrote a default config to %s", ConfigPath.string().c_str());
 	}
@@ -268,6 +301,15 @@ namespace
 		else if (Key == "allow_spawn_probes")
 		{
 			g_Config.allow_spawn_probes = (Value == "1" || Value == "true");
+		}
+		else if (Key == "solo_duel")
+		{
+			g_Config.solo_duel = (Value == "1" || Value == "true");
+		}
+		else if (Key == "solo_duel_army")
+		{
+			if (!Value.empty())
+				g_Config.solo_duel_army = Value;
 		}
 	}
 
@@ -486,6 +528,16 @@ namespace
 
 		if (WasKeyPressed(kKeyProbe))
 			hmd::probe::Report();
+
+		// Solo duel. In this group rather than the network group because
+		// StartSoloDuel reads the room and the run state to decide whether it
+		// can run at all, and both of those touch the game.
+		//
+		// The press itself only sets up state; the injection happens on the
+		// next tick through the ordinary phase machine, inside the same safe
+		// window every other duel uses.
+		if (WasKeyPressed(kKeySoloDuel))
+			hmd::match::StartSoloDuel();
 
 		if (WasKeyPressed(kKeySelfTest))
 		{
@@ -815,6 +867,7 @@ EXPORTED AurieStatus ModuleInitialize(
 	hmd::roster::SetAllowSpawnProbes(g_Config.allow_spawn_probes);
 
 	hmd::match::SetSyncRunStart(g_Config.sync_run_start);
+	hmd::match::SetSoloDuel(g_Config.solo_duel, g_Config.solo_duel_army);
 
 	// Observational only, and optional. These watch the game spawn its own
 	// enemies so the mod can learn a signature YYC stripped, rather than

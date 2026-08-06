@@ -99,15 +99,9 @@ Run install.bat
 Anything showing `[--] NOT found` points at the matching part of Step 2. The mod
 itself is already installed, so you only ever need to redo the framework bits.
 
-Then **launch the game**. If everything is working you'll see a console window
-alongside the game with a green line like:
+Then **launch the game**. If everything is working you'll see a console window.
 
-```
-[HMD-MP] ready. F9 host | F10 join | F11 disconnect | F8 status | F6 diagnostics
-```
-
-That line means you're done. No console window at all means Aurie isn't
-loading - see [Troubleshooting](#troubleshooting).
+No console window at all means Aurie isn't loading - see [Troubleshooting](#troubleshooting).
 
 ---
 
@@ -115,17 +109,11 @@ loading - see [Troubleshooting](#troubleshooting).
 
 One of you invites, the other accepts. **Press F7 twice:**
 
-- **First F7** - opens a Steam lobby. Wait for `steam: lobby open` in the console
-- **Second F7** - opens Steam's invite dialog. Pick your friend
-
-Your friend clicks the invite and you're connected. No ports, no IP addresses,
-works over the internet.
+- **First F7** - opens a Steam lobby.
+- **Second F7** - opens Steam's invite dialog. Pick your friend.
 
 > Shift+Tab on its own won't show an "Invite to Game" option for this mod - you
 > have to open the dialog with F7. Press **F8** any time to check the link.
-
-On a local network you can skip Steam entirely: one player presses **F9**, the
-other presses **F10**.
 
 ### What you'll see once you're connected
 
@@ -178,7 +166,6 @@ the synced start with `sync_run_start`. Both players should use the same
 | Worked yesterday, broken today | Steam updated or verified the game | Re-run step 2c, then `install.bat` |
 | No "Invite to Game" when you press Shift+Tab | Expected - the mod doesn't advertise to the friends list | Press **F7 twice** instead. The second press opens Steam's invite dialog |
 | **F7** twice shows no dialog | Steam overlay isn't loading | Steam → Settings → In Game → enable the overlay, and check the same box in the game's Properties |
-| **F10** does nothing / "no host answered" | Discovery blocked, or host isn't hosting | Confirm the other player pressed **F9** first. Allow the game through Windows Firewall on both PCs. Both on the same network? |
 | Connects, then immediately drops | Mismatched builds, or mismatched passphrase | You must both run the **same version** of the DLL. Check `session_key` matches exactly |
 | "peer presented the wrong session key" | Passphrase mismatch | Make them identical on both machines, including spaces |
 | Round 20 passes normally, no duel | Not connected, or the round number didn't resolve | Press **F8** for `link=connected`, then **F6** and look for `round=` and `tracking=` |
@@ -201,26 +188,16 @@ edits are never overwritten.
 
 | Setting | Default | What it's for |
 |---|---|---|
-| `peer_address` | `auto` | `auto` finds the host on your network. Or put an IP here for internet play |
-| `port` | `47801` | Both players must match. Discovery uses the next port up (`47802`) |
-| `session_key` | *(empty)* | Shared passphrase. Both players must match. Strongly recommended if you forward a port |
 | `enable_discovery` | `true` | Set `false` to disable network discovery and use addresses only |
-| `auto_host` | `false` | Host automatically at launch instead of pressing F9 |
-| `auto_join` | `false` | Join automatically at launch instead of pressing F10 |
+| `auto_host` | `false` | Host automatically at launch instead of pressing F7 |
+| `auto_join` | `false` | Join automatically at launch instead of steam joining |
 | `duel_interval` | `20` | Rounds between duels. Both players should match |
 | `sync_run_start` | `true` | One player pressing start also starts the other's run |
 | `on_screen_messages` | `true` | Show the mod's messages in-game. Turn off if they misbehave; the log still has them |
 
 ---
 
-## A few honest notes
-
-**This is a fresh mod that hasn't been played yet.** It builds cleanly and
-passes its full offline test suite (63/63), but end-to-end play needs two real
-clients and that hasn't happened. Treat your first session as a test run. If
-something misbehaves, the console tells you what - and the
-`--- members of o_dude ---` list it prints on the first run is the information
-needed to fix stat handling.
+## Notes
 
 **This mod doesn't touch your game files.** No modification to `data.win` or
 your saves - it loads alongside the game and works entirely in memory.
@@ -232,11 +209,6 @@ framework loads with the game. That's how Aurie works, it's reversible
 and it's a normal thing for a mod loader to do - but you should know it's
 happening.
 
-**There's no anti-cheat.** Stats coming from your opponent are bounds-checked 
-so nobody can spawn something unkillable, and a peer has to pass a handshake 
-before anything is exchanged - but a determined person could still cheat. 
-Play with people you know.
-
 **Both players must run the same build of the DLL.** Different versions refuse
 to connect rather than misbehave. If you update, send your friend the new file.
 
@@ -244,7 +216,7 @@ to connect rather than misbehave. If you update, send your friend the new file.
 
 ## For developers
 
-You don't need this to play - it's only for building the DLL yourself.
+You don't need this to play, it's only for building the DLL yourself.
 
 Requires Visual Studio 2022 (any edition, or Build Tools) with the **Desktop
 development with C++** workload. `build.bat` finds it for you.

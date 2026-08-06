@@ -198,10 +198,68 @@ namespace hmd::match
 			g_PeerRunPendingSince = {};
 		}
 
+		// -----------------------------------------------------------------
+		// Solo duel state
+		// -----------------------------------------------------------------
+
+		// Set once from the ini, read on the game thread. See match.h.
+		std::atomic<bool> g_SoloDuel{ false };
+		std::string g_SoloArmySpec = "basic:2";
+
+		// True only while a solo duel is in flight. Every solo-specific branch
+		// in the phase machine tests this rather than g_SoloDuel, so turning
+		// the feature off mid-session cannot strand a duel that has already
+		// started, and a real duel is never affected by a stale flag.
+		bool g_SoloDuelActive = false;
+
+		// Whether a peer link was ever established this session. Distinguishes
+		// "the opponent dropped" from "there was never an opponent", which the
+		// disconnect watchdog cannot otherwise tell apart - it sees only that
+		// net::IsConnected() is false, which is equally true of both.
+		bool g_HadPeer = false;
+
+		// The round an automatic solo duel last fired on, so it fires once per
+		// round rather than on every tick of it. Zeroed whenever the player
+		// leaves a run, so a new run starts fresh.
+		int g_LastAutoSoloRound = 0;
+
+		// The size of the wave the game is currently building, and how many
+		// consecutive ticks it has stayed that size.
+		//
+		// "At least one enemy exists" is not the same as "the wave is finished",
+		// and round 4 of the 20:35 run is what that difference costs: injection
+		// fired with one enemy on the field while o_gameplay_Create_0 was still
+		// inside its spawn loop. Clearing instances underneath a running
+		// enemy_spawn left the game's next instance_create with a combatant
+		// whose Destroy path was already torn down:
+		//
+		//     argument is not a method, unable to call
+		//     gml_Object_o_combatant_Destroy_0:2
+		//     gml_Object_o_enemy_Destroy_0:2
+		//     gml_Script_instance_create:13
+		//     gml_Script_enemy_spawn:97
+		//     gml_Object_o_gameplay_Create_0:263
+		//
+		// Rounds 1-3 cleared 10, 13 and 6 instances and were fine; round 4
+		// cleared 1 and crashed. So the gate waits for the count to stop moving
+		// rather than for it to become non-zero.
+		size_t g_WaveSize = 0;
+		int g_WaveStableTicks = 0;
+
+		// Six ticks is a tenth of a second at 60fps - long enough that a spawn
+		// loop spread over several frames has visibly finished, short enough
+		// that nobody waits for their round to start.
+		constexpr int kWaveStableTicks = 6;
+
 		// How the opponent should be referred to on screen. Their own reported
 		// name first, then whatever Steam told us, then something neutral.
 		std::string PeerLabel()
 		{
+			// A solo duel has no opponent, and calling the dummy army by the
+			// name of whoever happens to be connected would be a lie on screen.
+			if (g_SoloDuelActive)
+				return "the practice army";
+
 			if (!g_PeerPresence.name.empty())
 				return g_PeerPresence.name;
 
@@ -210,6 +268,113 @@ namespace hmd::match
 				return steam_name;
 
 			return "your opponent";
+		}
+
+		// Turn "basic:2,quantum:1" into the payload a peer would have sent.
+		//
+		// The output is a real matchup document rather than a bare map, because
+		// InjectOpponentArmy parses exactly what crosses the wire and the whole
+		// point of this harness is that the code under test cannot tell the
+		// difference. It is built with the JSON writer for the same reason -
+		// hand-assembled text would be a second format that could drift from
+		// the first.
+		//
+		// A malformed entry is skipped with a warning rather than failing the
+		// whole spec: a typo in one of three types should cost that type, not
+		// the test.
+		std::string BuildSoloArmyPayload(const std::string& Spec)
+		{
+			json::Value dudes = json::Value::Object();
+			json::Value order = json::Value::Array();
+
+			size_t start = 0;
+			int types = 0;
+
+			while (start <= Spec.size())
+			{
+				const size_t comma = Spec.find(',', start);
+				const std::string entry = Spec.substr(start,
+					comma == std::string::npos ? std::string::npos
+											   : comma - start);
+
+				start = comma == std::string::npos
+					? Spec.size() + 1 : comma + 1;
+
+				const size_t colon = entry.find(':');
+				if (colon == std::string::npos)
+				{
+					if (!entry.empty())
+						LogWarn("solo_duel_army entry '%s' has no ':count' - "
+							"skipping it", entry.c_str());
+					continue;
+				}
+
+				std::string type = entry.substr(0, colon);
+				const std::string count_text = entry.substr(colon + 1);
+
+				// Trim: an ini list is written by a person.
+				while (!type.empty() && isspace(static_cast<unsigned char>(type.front())))
+					type.erase(type.begin());
+				while (!type.empty() && isspace(static_cast<unsigned char>(type.back())))
+					type.pop_back();
+
+				if (type.empty())
+					continue;
+
+				int count = 0;
+				try
+				{
+					count = std::stoi(count_text);
+				}
+				catch (const std::exception&)
+				{
+					LogWarn("solo_duel_army entry '%s' has no readable count - "
+						"skipping it", entry.c_str());
+					continue;
+				}
+
+				// The same bound the injection path applies to a peer. A typo
+				// here should cost a small wave rather than a hung round.
+				count = static_cast<int>(
+					sanitize::ClampNumber(count, 0.0, 40.0));
+
+				if (count <= 0)
+					continue;
+
+				dudes.Set(type, json::Value(static_cast<double>(count)));
+				order.Push(json::Value(type));
+				types++;
+			}
+
+			if (types == 0)
+				return {};
+
+			// The rest of the document is what BuildDuelPayload emits: the army
+			// in `dudes`, `enemies` empty, no boss. Every other key is present
+			// because IsMatchupPayload counts them and because a payload this
+			// harness produces should be indistinguishable from a real one.
+			json::Value root = json::Value::Object();
+			root.Set("dudes", dudes);
+			root.Set("roster_order", order);
+			root.Set("enemies", json::Value::Object());
+			root.Set("non_boss_enemies", json::Value::Object());
+			root.Set("boss_fight_id", json::Value(std::string{}));
+			root.Set("relics", json::Value::Object());
+			root.Set("relic_order", json::Value::Array());
+			root.Set("consumables", json::Value::Object());
+			root.Set("food", json::Value::Object());
+			root.Set("food_ids", json::Value::Array());
+			root.Set("arena_modifiers", json::Value::Array());
+			root.Set("trinket_dude_types", json::Value::Object());
+			root.Set("dude_type_trinkets", json::Value::Object());
+			root.Set("cash", json::Value(0.0));
+			root.Set("tier", json::Value(1.0));
+			root.Set("difficulty_score", json::Value(0.0));
+			root.Set("estimated_dude_count", json::Value(0.0));
+			root.Set("estimated_relic_count", json::Value(0.0));
+			root.Set("estimated_round", json::Value(0.0));
+
+			return root.Serialize();
 		}
 
 		// -----------------------------------------------------------------
@@ -659,9 +824,90 @@ namespace hmd::match
 			return any_standing ? Outcome::Undecided : Outcome::LocalLost;
 		}
 
+		// Fire one solo duel per round, as soon as the arena is populated.
+		//
+		// "Populated" is the trigger rather than the round number alone,
+		// because a round number ticks over before the game has spawned
+		// anything, and injecting into an empty arena would clear a wave that
+		// has not arrived and then fight nothing.
+		// Reset the wave-settling measurement. Anything that means "the wave I
+		// was watching is no longer the wave in front of me" goes through here,
+		// so a stale count can never be mistaken for a settled one.
+		void ForgetWaveSize()
+		{
+			g_WaveSize = 0;
+			g_WaveStableTicks = 0;
+		}
+
+		void MaybeAutoStartSoloDuel()
+		{
+			if (!g_SoloDuel.load() || g_SoloDuelActive)
+				return;
+
+			// A real match always wins. Practice never interferes with it.
+			if (net::IsConnected())
+				return;
+
+			if (!InRun())
+			{
+				g_LastAutoSoloRound = 0;
+				ForgetWaveSize();
+				return;
+			}
+
+			const Phase phase = g_Phase.load();
+			if (phase != Phase::Idle && phase != Phase::Offline)
+				return;
+
+			const int round = runstate::CurrentRound();
+			if (round <= 0 || round == g_LastAutoSoloRound)
+				return;
+
+			// Wait for the game to put its own wave in before replacing it, and
+			// then for it to STOP arriving. Clearing instances while the game is
+			// still inside its own spawn loop is what killed round 4 of the
+			// 20:35 run - see g_WaveSize.
+			const size_t enemies = bridge::FindInstances("o_enemy").size();
+			if (enemies == 0)
+			{
+				ForgetWaveSize();
+				return;
+			}
+
+			if (enemies != g_WaveSize)
+			{
+				g_WaveSize = enemies;
+				g_WaveStableTicks = 0;
+				return;
+			}
+
+			if (++g_WaveStableTicks < kWaveStableTicks)
+				return;
+
+			// Marked before the attempt, not after. If the duel declines for a
+			// reason this function cannot see, the message should appear once
+			// for the round rather than on every tick of it.
+			g_LastAutoSoloRound = round;
+			ForgetWaveSize();
+
+			LogInfo("solo_duel is on and round %d has started with a settled "
+				"wave of %zu - beginning a practice duel automatically", round,
+				enemies);
+
+			StartSoloDuel();
+		}
+
 		void ApplyOutcome(bool LocalWon)
 		{
-			if (!LocalWon)
+			// Practice does not cost lives. A harness that can end the run it
+			// is being used to debug would be worse than the bug.
+			if (g_SoloDuelActive)
+			{
+				ui::Notify(LocalWon
+					? "You beat the practice army."
+					: "The practice army beat you. No life lost.");
+			}
+			else if (!LocalWon)
 			{
 				g_Lives.local--;
 				ui::Notify("You lost the duel. %d %s left.",
@@ -672,7 +918,11 @@ namespace hmd::match
 				ui::Notify("You beat %s's army!", PeerLabel().c_str());
 			}
 
-			if (!g_ResultSent)
+			// A solo duel has nobody to tell. Sending would be harmless with no
+			// peer connected, but it would also be a message claiming a result
+			// in a match that is not happening - and if a peer IS connected
+			// while someone is practising, it would corrupt their score.
+			if (!g_ResultSent && !g_SoloDuelActive)
 			{
 				net::Send(BuildResultMessage(LocalWon));
 				g_ResultSent = true;
@@ -722,6 +972,11 @@ namespace hmd::match
 		// plainly rather than being crashed on their behalf.
 		void AbandonDuel(const char* Reason)
 		{
+			// Whatever went wrong, this duel is over - so the solo flag comes
+			// down here rather than only on the success path. Leaving it set
+			// would make the next REAL duel skip waiting for its peer's result.
+			g_SoloDuelActive = false;
+
 			roster::SetDefaultWaveSuppressed(false);
 
 			// Anything the mod spawned comes out first, and before anything
@@ -956,6 +1211,23 @@ namespace hmd::match
 		// A run the peer asked for is started here, on the game's thread.
 		DrainPendingRunStart();
 
+		// Automatic solo duels, before the disconnect watchdog gets a say.
+		//
+		// A solo duel has to start at the beginning of a battle. That is not a
+		// convenience: `dude_generate` calls roster_order_refresh, and pressing
+		// F4 partway through a fight aborted it -
+		//
+		//     I32 argument is undefined
+		//     gml_Script_roster_order_refresh:18
+		//     gml_Script_dude_generate:136
+		//
+		// - while the same call at round start worked. Multiplayer never hit
+		// this because a real duel always injects seconds after the duel round
+		// is entered, with the roster untouched. Firing automatically is
+		// therefore the harness matching the conditions it is meant to stand in
+		// for, not just saving a keypress.
+		MaybeAutoStartSoloDuel();
+
 		const Phase phase = g_Phase.load();
 
 		// A dropped link ends the match. There is no resuming: matches are not
@@ -963,7 +1235,23 @@ namespace hmd::match
 		// next connection starts a fresh one with full lives. This also covers
 		// GameOver, which must return to Offline or a later session would find
 		// the phase stuck and never start.
-		if (!net::IsConnected())
+		//
+		// A SOLO DUEL IS EXEMPT, and missing that killed the first one on the
+		// tick after it started:
+		//
+		//     15:29:06  phase -> injecting (solo duel started)
+		//     15:29:06  Your opponent disconnected - the match is over
+		//     15:29:06  phase -> offline (peer link lost - match ended)
+		//
+		// "Not connected" is the normal and permanent state of a solo duel, so
+		// this check reads it as a peer that vanished and tears the duel down
+		// before Phase::Injecting ever runs. The player sees the round carry on
+		// with its own enemies and no sign that anything was attempted.
+		//
+		// This is the same mistake the file already records twice under
+		// "suspect the mod's own safety checks": a guard written against a real
+		// failure, placed where it also rejects the legitimate case.
+		if (!net::IsConnected() && !g_SoloDuelActive)
 		{
 			// Receiving from someone we are not connected to is not a
 			// contradiction - draining the inbound queue deliberately does not
@@ -988,7 +1276,14 @@ namespace hmd::match
 
 			if (phase != Phase::Offline)
 			{
-				if (phase != Phase::GameOver)
+				// Only mourn an opponent that existed. A solo duel ends in
+				// Idle with no link, and this tick is the first to look at it -
+				// so without the guard every practice round would finish by
+				// announcing the disconnection of a peer the player never had.
+				//
+				// Worth having independently of solo duels: the message is
+				// simply false in any session that never connected.
+				if (phase != Phase::GameOver && g_HadPeer)
 				{
 					ui::Notify("Your opponent disconnected - the match is over "
 						"(lives were %d to %d).", g_Lives.local, g_Lives.remote);
@@ -996,7 +1291,11 @@ namespace hmd::match
 
 				roster::SetDefaultWaveSuppressed(false);
 				ResetMatchState();
-				SetPhase(Phase::Offline, "peer link lost - match ended");
+				SetPhase(Phase::Offline, g_HadPeer
+					? "peer link lost - match ended"
+					: "no peer - returning to offline");
+
+				g_HadPeer = false;
 			}
 
 			PushOverlay({});
@@ -1006,6 +1305,7 @@ namespace hmd::match
 		if (phase == Phase::Offline)
 		{
 			// Every connection is a new match, by design.
+			g_HadPeer = true;
 			ResetMatchState();
 			SetPhase(Phase::Idle, "peer link established - new match, 3 lives each");
 			ui::Notify("Connected to %s. 3 lives each - duels every %d rounds.",
@@ -1339,16 +1639,43 @@ namespace hmd::match
 		{
 			// Wait for the peer's own result so both clients agree on the score
 			// before deciding whether the run continues.
-			if (!g_PeerResultReceived)
+			//
+			// A solo duel has no peer to hear from, so it resolves on the local
+			// result alone. This is the ONLY step of the duel a solo run does
+			// not exercise, and it is named here so that is not forgotten:
+			// whatever this harness proves, it does not prove the two clients
+			// agree about who won.
+			if (!g_PeerResultReceived && !g_SoloDuelActive)
 			{
 				banner = "WAITING FOR THEIR RESULT...";
 				break;
 			}
 
-			LogStage(kStageResolve, "lives - local %d, remote %d",
-				g_Lives.local, g_Lives.remote);
+			// The injected units come out here, on the ordinary success path.
+			//
+			// Until now nothing removed them: a real duel's units were left to
+			// the game's own death path, which works but only because the
+			// player killed them. A solo duel that is abandoned, or a round
+			// that ends with one still standing, needs this - and calling it
+			// unconditionally means RemoveInjectedWave is finally exercised by
+			// ordinary play rather than only by the failure paths.
+			const int withdrawn = roster::RemoveInjectedWave();
 
-			if (g_Lives.local <= 0 || g_Lives.remote <= 0)
+			if (withdrawn > 0)
+				LogInfo("withdrew %d injected unit(s) at the end of the duel",
+					withdrawn);
+
+			const bool was_solo = g_SoloDuelActive;
+			g_SoloDuelActive = false;
+
+			LogStage(kStageResolve, "lives - local %d, remote %d%s",
+				g_Lives.local, g_Lives.remote,
+				was_solo ? " (solo duel - remote is not a real opponent)" : "");
+
+			// A solo duel must never end the match. Practice that can burn
+			// through three lives and declare the run over would make the
+			// harness worse than the thing it is testing.
+			if (!was_solo && (g_Lives.local <= 0 || g_Lives.remote <= 0))
 			{
 				ui::Notify("%s", g_Lives.local <= 0
 					? "You are out of lives. Match over."
@@ -1383,5 +1710,148 @@ namespace hmd::match
 		}
 
 		PushOverlay(banner);
+	}
+
+	// -----------------------------------------------------------------------
+	// Solo duel
+	// -----------------------------------------------------------------------
+
+	void SetSoloDuel(bool Enabled, const std::string& Army)
+	{
+		g_SoloDuel.store(Enabled);
+
+		if (!Army.empty())
+			g_SoloArmySpec = Army;
+
+		if (!Enabled)
+			return;
+
+		LogWarn("solo_duel is ON. F4 fights a synthetic army with no peer, "
+			"using the real duel path. Practice costs no lives and sends "
+			"nothing over the network. Set solo_duel = false in the ini to go "
+			"back to duelling real opponents.");
+
+		// Reported at startup rather than at first press, so a typo in the ini
+		// is visible before it costs a round.
+		const std::string preview = BuildSoloArmyPayload(g_SoloArmySpec);
+
+		if (preview.empty())
+		{
+			LogError("solo_duel_army = '%s' produced no army at all. F4 will "
+				"decline until this reads like 'basic:2,quantum:1'.",
+				g_SoloArmySpec.c_str());
+		}
+		else
+		{
+			LogInfo("solo_duel_army = '%s'", g_SoloArmySpec.c_str());
+		}
+	}
+
+	bool SoloDuelEnabled()
+	{
+		return g_SoloDuel.load();
+	}
+
+	bool SoloDuelActive()
+	{
+		return g_SoloDuelActive;
+	}
+
+	// Every reason this can decline is reported, because a hotkey that does
+	// nothing silently is indistinguishable from a hotkey that is broken - and
+	// this one is pressed precisely when something else is already suspect.
+	void StartSoloDuel()
+	{
+		if (!g_SoloDuel.load())
+		{
+			LogInfo("solo duels are off. Set solo_duel = true in "
+				"HowManyDudesMultiplayer.ini and restart the game.");
+			ui::Notify("Solo duels are off - see the ini.");
+			return;
+		}
+
+		// A connected peer is in a real match, and dropping a practice wave
+		// into it would desync both sides. Refused rather than reconciled.
+		if (net::IsConnected())
+		{
+			LogWarn("a peer is connected - refusing to start a solo duel so a "
+				"real match is not disturbed. Press F11 to disconnect first.");
+			ui::Notify("Disconnect first - a real opponent is connected.");
+			return;
+		}
+
+		if (CurrentPhase() != Phase::Idle && CurrentPhase() != Phase::Offline)
+		{
+			LogWarn("a duel is already in progress (phase %s) - not starting "
+				"another", PhaseName());
+			ui::Notify("A duel is already running.");
+			return;
+		}
+
+		if (!InRun())
+		{
+			LogWarn("not in a live round - a solo duel needs an arena to spawn "
+				"into. Start a run and get into a fight first.");
+			ui::Notify("Get into a fight first.");
+			return;
+		}
+
+		// Pressing this late in a fight is what aborted inside
+		// roster_order_refresh, so a manual press says so rather than silently
+		// reproducing it. It is a warning and not a refusal: F4 is still the
+		// way to ask the question deliberately, and the automatic trigger is
+		// the way to avoid it.
+		if (g_LastAutoSoloRound != runstate::CurrentRound())
+		{
+			LogWarn("starting a solo duel by hand. dude_generate aborts inside "
+				"roster_order_refresh when the roster has already been fought "
+				"over, so if this kills the game, press it at the START of a "
+				"battle - or leave solo_duel on and let it fire by itself.");
+		}
+
+		const std::string payload = BuildSoloArmyPayload(g_SoloArmySpec);
+
+		if (payload.empty())
+		{
+			LogError("solo_duel_army = '%s' produced no army - nothing to "
+				"fight", g_SoloArmySpec.c_str());
+			ui::Notify("solo_duel_army is empty or malformed.");
+			return;
+		}
+
+		// Built through the same deserialiser a peer's bytes go through, so
+		// the harness cannot accidentally construct a Snapshot that the real
+		// path could never receive. If this rejects its own payload, that is a
+		// finding about the payload rather than something to work around.
+		json::Value envelope = json::Value::Object();
+		envelope.Set("proto", json::Value(1));
+		envelope.Set("act", json::Value(runstate::CurrentAct()));
+		envelope.Set("lives", json::Value(3));
+		envelope.Set("matchup", json::Value(payload));
+		envelope.Set("units", json::Value::Array());
+
+		roster::Snapshot army;
+		if (!roster::Snapshot::Deserialize(envelope.Serialize(), army))
+		{
+			LogError("the synthetic army did not survive the mod's own peer "
+				"deserialiser. That is a real defect in the payload format, "
+				"not a problem with this harness.");
+			ui::Notify("The practice army failed its own validation.");
+			return;
+		}
+
+		g_PeerArmy = army;
+		g_PeerResultReceived = false;
+		g_ResultSent = false;
+		g_InjectedCount = 0;
+		g_SawInjectedEnemies = false;
+		g_SoloDuelActive = true;
+
+		LogInfo("SOLO DUEL: fighting '%s' with no peer. Everything after this "
+			"point is the real duel path.", g_SoloArmySpec.c_str());
+
+		ui::Notify("Practice duel: %s", g_SoloArmySpec.c_str());
+
+		SetPhase(Phase::Injecting, "solo duel started");
 	}
 }

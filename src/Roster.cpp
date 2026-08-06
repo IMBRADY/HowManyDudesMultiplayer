@@ -1993,6 +1993,275 @@ namespace hmd::roster
 		// array is how the opponent's army becomes the wave - and the game
 		// builds it, correctly, with none of the half-initialised units this
 		// session's crash was made of.
+
+		// How much reading one probe press is allowed to do.
+		//
+		// The struct path asks one question per global. The array path asks one
+		// per ELEMENT, and this build has thousands of globals - an unbounded
+		// walk is a stall in the middle of a live fight.
+		//
+		// The budget is spent across the whole press and reported when it runs
+		// out, because "stopped early" and "found nothing" are different
+		// answers, and the second one is about to be used as evidence that a
+		// structure is clean.
+		struct ScanBudget
+		{
+			int remaining = 20000;
+			bool exhausted = false;
+
+			bool Spend()
+			{
+				if (remaining <= 0)
+				{
+					exhausted = true;
+					return false;
+				}
+
+				remaining--;
+				return true;
+			}
+		};
+
+		// Whether a struct names the key in one of its string FIELD VALUES, and
+		// which field.
+		//
+		// variable_struct_exists already answers the member-name question. This
+		// answers the other shape: a record that carries its type in a field,
+		// which is what an array of dude records looks like.
+		bool StructHasStringValue(
+			const RValue& Struct,
+			const std::string& Wanted,
+			ScanBudget& Budget,
+			std::string& FieldName
+		)
+		{
+			auto names = bridge::CallBuiltin("struct_get_names", { Struct });
+			if (!names || names->m_Kind != VALUE_ARRAY)
+				return false;
+
+			auto length = bridge::CallBuiltin("array_length", { *names });
+			if (!length || (length->m_Kind != VALUE_REAL &&
+				length->m_Kind != VALUE_INT32 && length->m_Kind != VALUE_INT64))
+				return false;
+
+			const int fields = static_cast<int>(length->ToDouble());
+
+			for (int f = 0; f < fields && f < 32; f++)
+			{
+				if (!Budget.Spend())
+					return false;
+
+				auto name = bridge::CallBuiltin("array_get",
+					{ *names, RValue(static_cast<double>(f)) });
+
+				if (!name || name->m_Kind != VALUE_STRING || !name->ToCString())
+					continue;
+
+				auto value = bridge::CallBuiltin("variable_struct_get",
+					{ Struct, *name });
+
+				if (!value || value->m_Kind != VALUE_STRING || !value->ToCString())
+					continue;
+
+				if (Wanted == value->ToCString())
+				{
+					FieldName = name->ToCString();
+					return true;
+				}
+			}
+
+			return false;
+		}
+
+		// Report every element of an array global that mentions the key.
+		//
+		// Arrays were skipped entirely until now, and global.ROSTER_ORDER is the
+		// proof that was a hole: it held the injected type, three separate
+		// routines aborted reading it, and this probe could not have seen it. It
+		// had to be found by trying plausible names instead - which is the
+		// guessing the probe exists to replace.
+		//
+		// Three shapes are recognised, because the ordering bug established that
+		// the mod cannot assume which one a structure uses:
+		//
+		//     "quantum"                  a bare type name, what ROSTER_ORDER holds
+		//     { quantum: ... }           a record keyed by type
+		//     { type: "quantum", ... }   a record naming its type in a field
+		//
+		// Read-only throughout - array_length, array_get, struct_get_names and
+		// variable_struct_get. Nothing here writes to game state.
+		int ScanArrayForKey(
+			const char* Label,
+			const RValue& Array,
+			const std::string& Key,
+			ScanBudget& Budget
+		)
+		{
+			const char* GlobalName = Label;
+			auto length = bridge::CallBuiltin("array_length", { Array });
+			if (!length || (length->m_Kind != VALUE_REAL &&
+				length->m_Kind != VALUE_INT32 && length->m_Kind != VALUE_INT64))
+				return 0;
+
+			const double raw = length->ToDouble();
+			if (!std::isfinite(raw))
+				return 0;
+
+			const int count = static_cast<int>(raw);
+			if (count <= 0)
+				return 0;
+
+			// An absurd length means this is not the array it claims to be, and
+			// walking it would be reading whatever sits next in memory. The cap
+			// is loud rather than silent: an oversized array that genuinely
+			// holds the key would otherwise be dismissed as clean.
+			if (count > 4096)
+			{
+				SelfTestWarn("    global.%s is an array of %d entries - too large "
+					"to be a roster structure, skipped unread", GlobalName, count);
+				return 0;
+			}
+
+			const RValue key(Key);
+
+			int hits = 0;
+
+			for (int i = 0; i < count; i++)
+			{
+				if (!Budget.Spend())
+					break;
+
+				auto entry = bridge::CallBuiltin("array_get",
+					{ Array, RValue(static_cast<double>(i)) });
+
+				if (!entry)
+					continue;
+
+				if (entry->m_Kind == VALUE_STRING)
+				{
+					const char* text = entry->ToCString();
+					if (text && Key == text)
+					{
+						hits++;
+						SelfTestLog("    FOUND: global.%s[%d] = \"%s\" - a bare "
+							"type name in an ordering", GlobalName, i, Key.c_str());
+					}
+
+					continue;
+				}
+
+				const bool struct_shaped = entry->m_Kind == VALUE_OBJECT ||
+					entry->m_Kind == VALUE_REF;
+
+				if (!struct_shaped || !entry->m_Pointer)
+					continue;
+
+				auto keyed = bridge::CallBuiltin("variable_struct_exists",
+					{ *entry, key });
+
+				if (keyed && keyed->m_Kind == VALUE_BOOL && keyed->ToBoolean())
+				{
+					hits++;
+					SelfTestLog("    FOUND: global.%s[%d] is a struct with a "
+						"\"%s\" member", GlobalName, i, Key.c_str());
+					continue;
+				}
+
+				std::string field;
+				if (StructHasStringValue(*entry, Key, Budget, field))
+				{
+					hits++;
+					SelfTestLog("    FOUND: global.%s[%d].%s = \"%s\" - a record "
+						"naming its type", GlobalName, i, field.c_str(),
+						Key.c_str());
+				}
+			}
+
+			return hits;
+		}
+
+		// Search a struct global's member VALUES for the key.
+		//
+		// Two shapes, both invisible to variable_struct_exists, which only ever
+		// answers the member-NAME question:
+		//
+		//     { basic: ["a1", "p4f"] }   an id list indexed by type
+		//     { slot3: "p4f" }           a single id under some other name
+		//
+		// The first is what dude_type_get_dude_ids implies and therefore what
+		// dude_type_get_num_conscious walks. Nothing else in the probe can see
+		// it: the global is a struct so the array path never runs, and the key
+		// is a value so the name test fails.
+		//
+		// Members are capped at 64 - wider than the 32 used for describing a
+		// record, because this is a search rather than a dump and a roster
+		// indexed by type could legitimately carry one entry per type.
+		int ScanStructValuesForKey(
+			const char* GlobalName,
+			const RValue& Struct,
+			const std::string& Key,
+			ScanBudget& Budget
+		)
+		{
+			auto names = bridge::CallBuiltin("struct_get_names", { Struct });
+			if (!names || names->m_Kind != VALUE_ARRAY)
+				return 0;
+
+			auto length = bridge::CallBuiltin("array_length", { *names });
+			if (!length || (length->m_Kind != VALUE_REAL &&
+				length->m_Kind != VALUE_INT32 && length->m_Kind != VALUE_INT64))
+				return 0;
+
+			const int fields = static_cast<int>(length->ToDouble());
+			if (fields <= 0)
+				return 0;
+
+			int hits = 0;
+
+			for (int f = 0; f < fields && f < 64; f++)
+			{
+				if (!Budget.Spend())
+					break;
+
+				auto field = bridge::CallBuiltin("array_get",
+					{ *names, RValue(static_cast<double>(f)) });
+
+				if (!field || field->m_Kind != VALUE_STRING || !field->ToCString())
+					continue;
+
+				const std::string field_name = field->ToCString();
+
+				auto field_value = bridge::CallBuiltin("variable_struct_get",
+					{ Struct, *field });
+
+				if (!field_value)
+					continue;
+
+				if (field_value->m_Kind == VALUE_STRING &&
+					field_value->ToCString() && Key == field_value->ToCString())
+				{
+					hits++;
+					SelfTestLog("    FOUND: global.%s.%s = \"%s\" - the id under "
+						"a named member", GlobalName, field_name.c_str(),
+						Key.c_str());
+					continue;
+				}
+
+				if (field_value->m_Kind != VALUE_ARRAY || !field_value->m_Pointer)
+					continue;
+
+				// An id list under a type name. The label carries the member so
+				// the log names the type the stale id is filed under, which is
+				// the argument dude_type_get_num_conscious was called with.
+				const std::string label = std::string(GlobalName) + "." +
+					field_name;
+
+				hits += ScanArrayForKey(label.c_str(), *field_value, Key, Budget);
+			}
+
+			return hits;
+		}
+
 		// ------------------------------------------------------------------
 		// Phase 6: find the spawn plan
 		// ------------------------------------------------------------------
@@ -2046,6 +2315,9 @@ namespace hmd::roster
 
 			int hits = 0;
 			int structs = 0;
+			int arrays = 0;
+
+			ScanBudget budget;
 
 			for (const std::string& name : globals)
 			{
@@ -2053,7 +2325,18 @@ namespace hmd::roster
 				if (!value)
 					continue;
 
-				// Structs only. A ds_map is a bare number, and calling
+				// Arrays are searched too. ROSTER_ORDER is an array, it held an
+				// injected type, and three routines aborted reading it - a
+				// struct-only search reports a structure like that as clean.
+				if (value->m_Kind == VALUE_ARRAY && value->m_Pointer)
+				{
+					arrays++;
+					hits += ScanArrayForKey(name.c_str(), *value, g_LastSpawnId,
+						budget);
+					continue;
+				}
+
+				// Structs otherwise. A ds_map is a bare number, and calling
 				// ds_map_exists on a number that is not a map id is exactly the
 				// kind of thing that has killed this game before.
 				const bool struct_shaped = value->m_Kind == VALUE_OBJECT ||
@@ -2116,15 +2399,81 @@ namespace hmd::roster
 				}
 			}
 
-			SelfTestLog("    checked %d struct-valued global(s); %d contained the "
-				"key", structs, hits);
+			SelfTestLog("    checked %d struct-valued and %d array-valued "
+				"global(s); %d mention the key", structs, arrays, hits);
 
-			if (hits == 0)
+			// The deep pass, and only when the cheap ones came back empty.
+			//
+			// Walking every member VALUE of every struct global costs roughly
+			// one call per member across thousands of structs - hundreds of
+			// times the work above, and a visible hitch. It is worth that only
+			// when the question is still open, and once the cheap passes find
+			// the key there is nothing left to ask.
+			//
+			// This is the pass that can see {"basic": ["...", "p4f"]}, the
+			// shape dude_type_get_dude_ids implies and the only one the probe
+			// has never been able to reach.
+			if (hits == 0 && !budget.exhausted)
 			{
-				SelfTestWarn("    no global struct holds it. The table is either "
-					"a ds_map, a local of the wave builder, or the id is not a "
-					"key at all - and in the last case the type must be an "
-					"argument the observer is not seeing");
+				SelfTestLog("    nothing holds it by name - searching member "
+					"VALUES now. This walks every member of every struct global "
+					"and the game will hitch for a moment.");
+
+				ScanBudget deep;
+				deep.remaining = 400000;
+
+				int deep_hits = 0;
+				int deep_structs = 0;
+
+				for (const std::string& name : globals)
+				{
+					if (deep.remaining <= 0)
+						break;
+
+					auto value = bridge::GetGlobal(name);
+					if (!value)
+						continue;
+
+					const bool struct_shaped = value->m_Kind == VALUE_OBJECT ||
+						value->m_Kind == VALUE_REF;
+
+					if (!struct_shaped || !value->m_Pointer)
+						continue;
+
+					deep_structs++;
+					deep_hits += ScanStructValuesForKey(name.c_str(), *value,
+						g_LastSpawnId, deep);
+				}
+
+				hits += deep_hits;
+
+				SelfTestLog("    deep pass: walked the members of %d struct(s); "
+					"%d mention the key", deep_structs, deep_hits);
+
+				if (deep.exhausted)
+				{
+					SelfTestWarn("    THE DEEP PASS RAN OUT OF BUDGET - it did "
+						"not reach every struct, and a structure holding the key "
+						"may have been missed");
+					budget.exhausted = true;
+				}
+			}
+
+			// Said before the verdict, because a truncated search that found
+			// nothing must not be read as a structure being clean.
+			if (budget.exhausted)
+			{
+				SelfTestWarn("    THE SEARCH RAN OUT OF BUDGET before finishing - "
+					"the result below is incomplete and a structure holding the "
+					"key may not have been reached");
+			}
+
+			if (hits == 0 && !budget.exhausted)
+			{
+				SelfTestWarn("    no global struct or array holds it. The table "
+					"is either a ds_map, a local of the wave builder, or the id "
+					"is not a key at all - and in the last case the type must be "
+					"an argument the observer is not seeing");
 			}
 		}
 
@@ -2375,11 +2724,165 @@ namespace hmd::roster
 		// for the same reason - it is presumed to have the same precondition,
 		// and presuming is free where calling is not.
 		//
-		// All three registries are cleared regardless of which one the record
-		// landed in: dude_generate registers into DUDES, animal_generate into
-		// ANIMALS and ANIMALS_CONSCIOUS, and an injected unit has been written
-		// into all three by hand. Removing a key that is not there is not an
-		// error.
+		// Take an injected unit's id out of a global array that lists dude ids.
+		//
+		// global.DUDE_IDS was found by the array scan the first time it ran, at
+		// 20:05:18 mid-fight and again at 20:05:28 after the round ended:
+		//
+		//     FOUND: global.DUDE_IDS[1] = "h99"
+		//
+		// It is the ID-keyed sibling of global.ROSTER_ORDER, which lists TYPES
+		// and is cleaned separately. dude_generate puts the injected unit in it
+		// and nothing took it back out, so the end-of-round scoreboard walks the
+		// list, reaches an id whose global.DUDES record the mod removed, and
+		// aborts - scoreboard_data_set:37, under victory_ui_spawn on a win and
+		// loss_ui_spawn on a loss.
+		//
+		// The array is confirmed to CONTAIN the key before anything is deleted.
+		// This build has 85 array-valued globals and writing to the wrong one
+		// would be a silent corruption with nothing to trace it by, so a name
+		// resolving to an array is not on its own enough to edit.
+		//
+		// array_delete is a builtin, not game GML, so it cannot abort the way
+		// roster_order_refresh did.
+		// Delete every occurrence of Key from one array value. Label is for the
+		// log only, and carries the member name when the array sits inside a
+		// struct - "DUDE_IDS_BY_TYPE.basic" rather than a bare global name.
+		void RemoveKeyFromArrayValue(
+			const std::string& Label,
+			const RValue& Array,
+			const std::string& Key
+		)
+		{
+			auto length = bridge::CallBuiltin("array_length", { Array });
+			if (!length || (length->m_Kind != VALUE_REAL &&
+				length->m_Kind != VALUE_INT32 && length->m_Kind != VALUE_INT64))
+				return;
+
+			const int count = static_cast<int>(length->ToDouble());
+			if (count <= 0)
+				return;
+
+			// Backwards: removing shifts everything after it down, and a forward
+			// walk would then skip the next entry.
+			for (int i = count - 1; i >= 0; i--)
+			{
+				auto entry = bridge::CallBuiltin("array_get",
+					{ Array, RValue(static_cast<double>(i)) });
+
+				if (!entry || entry->m_Kind != VALUE_STRING || !entry->ToCString())
+					continue;
+
+				if (Key != entry->ToCString())
+					continue;
+
+				if (bridge::CallBuiltin("array_delete",
+						{ Array, RValue(static_cast<double>(i)), RValue(1.0) }))
+				{
+					LogInfo("removed the injected unit's id \"%s\" from "
+						"global.%s at index %d - it is their army, not our "
+						"roster, and the end-of-round screens walk this list",
+						Key.c_str(), Label.c_str(), i);
+				}
+				else
+				{
+					LogWarn("could not remove \"%s\" from global.%s. The round "
+						"will abort at the end screen.", Key.c_str(),
+						Label.c_str());
+				}
+			}
+		}
+
+		void RemoveKeyFromIdArray(const char* GlobalName, const std::string& Key)
+		{
+			if (Key.empty())
+				return;
+
+			auto list = bridge::GetGlobal(GlobalName);
+			if (!list || list->m_Kind != VALUE_ARRAY || !list->m_Pointer)
+				return;
+
+			RemoveKeyFromArrayValue(GlobalName, *list, Key);
+		}
+
+		// Take an injected id out of a struct that indexes id arrays by type.
+		//
+		// global.DUDE_IDS_BY_TYPE, measured at 20:23:00 on the victory screen
+		// with the deep pass on its first run:
+		//
+		//     FOUND: global.DUDE_IDS_BY_TYPE.basic[1] = "fds"
+		//
+		// This is what dude_type_get_dude_ids reads. dude_type_get_num_conscious
+		// walks the list it returns and calls dude_is_knocked_out on each id;
+		// the injected id has no record behind it any more, so the lookup is
+		// undefined and the reward button aborts.
+		//
+		// EVERY type is swept, not just the injected one. The id is what is
+		// being removed and an id belongs to exactly one unit, so finding it
+		// under a type is sufficient on its own - unlike ROSTER_ORDER, where the
+		// entries are TYPE names shared with the player's own roster and
+		// removing the wrong one would delete a real dude type.
+		void RemoveKeyFromTypeIndexedArrays(
+			const char* GlobalName,
+			const std::string& Key
+		)
+		{
+			if (Key.empty())
+				return;
+
+			auto index = bridge::GetGlobal(GlobalName);
+			if (!index)
+				return;
+
+			const bool struct_shaped = index->m_Kind == VALUE_OBJECT ||
+				index->m_Kind == VALUE_REF;
+
+			if (!struct_shaped || !index->m_Pointer)
+				return;
+
+			auto names = bridge::CallBuiltin("struct_get_names", { *index });
+			if (!names || names->m_Kind != VALUE_ARRAY)
+				return;
+
+			auto length = bridge::CallBuiltin("array_length", { *names });
+			if (!length || (length->m_Kind != VALUE_REAL &&
+				length->m_Kind != VALUE_INT32 && length->m_Kind != VALUE_INT64))
+				return;
+
+			const int fields = static_cast<int>(length->ToDouble());
+
+			for (int f = 0; f < fields && f < 64; f++)
+			{
+				auto field = bridge::CallBuiltin("array_get",
+					{ *names, RValue(static_cast<double>(f)) });
+
+				if (!field || field->m_Kind != VALUE_STRING || !field->ToCString())
+					continue;
+
+				auto list = bridge::CallBuiltin("variable_struct_get",
+					{ *index, *field });
+
+				if (!list || list->m_Kind != VALUE_ARRAY || !list->m_Pointer)
+					continue;
+
+				RemoveKeyFromArrayValue(
+					std::string(GlobalName) + "." + field->ToCString(),
+					*list, Key);
+			}
+		}
+
+		// All four registries are cleared regardless of which one the record
+		// landed in: dude_generate registers into DUDES and DUDES_ACTIVE,
+		// animal_generate into ANIMALS and ANIMALS_CONSCIOUS, and an injected
+		// unit has been written into them by hand. Removing a key that is not
+		// there is not an error.
+		//
+		// DUDES_ACTIVE is the flag half of the dude pair - the exact counterpart
+		// of ANIMALS_CONSCIOUS on the animal side, which has been paired with
+		// ANIMALS here from the beginning. The dude side was cleaned on the
+		// record half only, and the spawn-plan probe measured the consequence:
+		// global.DUDES_ACTIVE["n4z"] still TRUE for an injected unit whose
+		// global.DUDES entry had already been removed.
 		void ForgetGeneratedRecord(const std::string& Key)
 		{
 			if (Key.empty())
@@ -2388,6 +2891,16 @@ namespace hmd::roster
 			RegistryRemove("ANIMALS", Key);
 			RegistryRemove("ANIMALS_CONSCIOUS", Key);
 			RegistryRemove("DUDES", Key);
+			RegistryRemove("DUDES_ACTIVE", Key);
+
+			// The array half of the same clean-up. Removing an id that is not
+			// there is not an error, same as the registries above.
+			RemoveKeyFromIdArray("DUDE_IDS", Key);
+
+			// And the per-type index behind dude_type_get_dude_ids, which the
+			// victory screen's roster walks. Cleaning DUDE_IDS alone left this
+			// one holding the id and the reward button aborted on it.
+			RemoveKeyFromTypeIndexedArrays("DUDE_IDS_BY_TYPE", Key);
 		}
 
 		// Render a registry answer without pretending unreadable means absent.
@@ -2622,6 +3135,20 @@ namespace hmd::roster
 		{
 			EnemyMarkers markers;
 
+			// animal_generate RAISES NUM_ENEMIES_ACTIVE, and the throwaway
+			// control this function creates is never spawned and never dies -
+			// so without putting the counter back, every injection leaked one
+			// phantom enemy that no instance corresponds to.
+			//
+			// Measured 15:48:49: the wave was cleared and the counter corrected
+			// to 0, then this function ran, and the value captured immediately
+			// afterwards as "before injection" was 1.
+			//
+			// ForgetGeneratedRecord cannot undo it - it removes registry
+			// entries, and the counter is not one.
+			const int enemies_before_control =
+				ReadGlobalCount("NUM_ENEMIES_ACTIVE");
+
 			std::string source;
 			const std::string enemy_type = ResolveInjectableType(source);
 
@@ -2670,12 +3197,214 @@ namespace hmd::roster
 			// The control was only ever a source of two values.
 			ForgetGeneratedRecord(control_key);
 
+			// And the counter it moved on the way.
+			if (enemies_before_control >= 0)
+			{
+				const int now = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
+
+				if (now != enemies_before_control)
+				{
+					LogInfo("the throwaway control record raised "
+						"NUM_ENEMIES_ACTIVE to %d - putting it back to %d",
+						now, enemies_before_control);
+
+					RestoreGlobalCount("NUM_ENEMIES_ACTIVE",
+						enemies_before_control);
+				}
+			}
+
 			LogInfo("marker values read from a live \"%s\" record: "
 				"combatant_type %s, alive flag %s", enemy_type.c_str(),
 				markers.have_combatant_type ? "ok" : "MISSING",
 				markers.have_conscious ? "ok" : "MISSING");
 
 			return markers;
+		}
+
+		// The global array holding the player's dude-type ordering.
+		//
+		// The name is not knowable from data.win - YYC strips VARI - so it is
+		// found the same way global.DUDES was: try the plausible names and see
+		// which one resolves to an array. GetGlobal on a global that does not
+		// exist returns nothing, with no call into game code, so asking is
+		// free. The winner is cached.
+		// Whether this array contains the given string.
+		bool ArrayHasString(const RValue& Array, const std::string& Wanted)
+		{
+			auto length = bridge::CallBuiltin("array_length", { Array });
+			if (!length || (length->m_Kind != VALUE_REAL &&
+				length->m_Kind != VALUE_INT32 && length->m_Kind != VALUE_INT64))
+				return false;
+
+			const int count = static_cast<int>(length->ToDouble());
+
+			for (int i = 0; i < count; i++)
+			{
+				auto entry = bridge::CallBuiltin("array_get",
+					{ Array, RValue(static_cast<double>(i)) });
+
+				if (entry && entry->m_Kind == VALUE_STRING &&
+					entry->ToCString() && Wanted == entry->ToCString())
+					return true;
+			}
+
+			return false;
+		}
+
+		// The name is not knowable from data.win - YYC strips VARI - so it is
+		// found the same way global.DUDES was: try the plausible names and see
+		// which resolves. GetGlobal on a global that does not exist returns
+		// nothing, with no call into game code, so asking is free.
+		//
+		// "Is an array" is NOT enough to identify it. This build has thousands
+		// of globals and several are arrays; deleting entries out of the wrong
+		// one would be a silent corruption with no error to trace it by. So a
+		// candidate must also CONTAIN one of the run's own dude types, which is
+		// what a roster ordering is by definition. A candidate that does not is
+		// some other array that happens to be named plausibly.
+		const char* FindRosterOrderGlobal(
+			const std::vector<std::string>& LocalTypes
+		)
+		{
+			static const char* cached = nullptr;
+			static bool searched = false;
+
+			if (searched)
+				return cached;
+
+			// Without a known local type there is nothing to confirm against,
+			// and guessing is what this check exists to prevent. Not marked as
+			// searched, so a later injection with a readable roster can try.
+			if (LocalTypes.empty())
+			{
+				LogWarn("this run's own dude types are unknown, so the roster "
+					"ordering cannot be identified safely - not editing any "
+					"global on a guess");
+				return nullptr;
+			}
+
+			searched = true;
+
+			for (const char* candidate : { "ROSTER_ORDER", "ROSTER",
+				"DUDE_ORDER", "DUDES_ORDER", "DUDE_TYPE_ORDER" })
+			{
+				auto value = bridge::GetGlobal(candidate);
+
+				if (!value || value->m_Kind != VALUE_ARRAY)
+					continue;
+
+				bool confirmed = false;
+				for (const std::string& type : LocalTypes)
+				{
+					if (ArrayHasString(*value, type))
+					{
+						confirmed = true;
+						break;
+					}
+				}
+
+				if (!confirmed)
+				{
+					LogInfo("global.%s is an array but holds none of this run's "
+						"dude types, so it is not the roster ordering",
+						candidate);
+					continue;
+				}
+
+				cached = candidate;
+				LogInfo("the roster ordering is global.%s - it holds this run's "
+					"own dude types", candidate);
+				return cached;
+			}
+
+			LogWarn("no global holding the roster ordering could be found under "
+				"any known name. The opponent's dude types cannot be taken out "
+				"of it, and the round will abort at the victory screen.");
+
+			return nullptr;
+		}
+
+		// Take the opponent's dude types back out of the player's ordering.
+		//
+		// This is the end-screen crash, and it is the fourth face of one rule:
+		// on this build a dude type has a RECORD in global.DUDES, a COUNT in
+		// NUM_DUDES_ACTIVE, and a PLACE IN AN ORDERING, and nothing the mod
+		// calls maintains all three together.
+		//
+		//     dude_generate(type)  adds all three
+		//     the mod              removed the record and fixed the count
+		//     nothing              touched the ordering
+		//
+		// The ordering then names a type the roster has nothing behind, and
+		// every consumer of it aborts on the lookup - scoreboard_data_set:37 at
+		// the end of one round, endscreen_unit_frame:5 at the end of another,
+		// roster_order_refresh:18 when the mod tried to repair it.
+		//
+		// Only types the local run does NOT have are removed. A player who
+		// genuinely owns quantum keeps their entry; the opponent's copy is what
+		// leaves. That distinction is why this takes the local type list rather
+		// than just deleting everything it injected.
+		void RemoveForeignTypesFromRosterOrder(
+			const json::Value& Army,
+			const std::vector<std::string>& LocalTypes
+		)
+		{
+			const char* global_name = FindRosterOrderGlobal(LocalTypes);
+			if (!global_name)
+				return;
+
+			for (const auto& [type, count] : Army.Members())
+			{
+				// Ours to keep.
+				if (std::find(LocalTypes.begin(), LocalTypes.end(), type) !=
+					LocalTypes.end())
+					continue;
+
+				auto order = bridge::GetGlobal(global_name);
+				if (!order || order->m_Kind != VALUE_ARRAY)
+					return;
+
+				auto length = bridge::CallBuiltin("array_length", { *order });
+				if (!length || (length->m_Kind != VALUE_REAL &&
+					length->m_Kind != VALUE_INT32 &&
+					length->m_Kind != VALUE_INT64))
+					return;
+
+				const int count_in_order = static_cast<int>(length->ToDouble());
+
+				// Backwards: removing shifts everything after it down, and a
+				// forward walk would then skip the next entry. The same type
+				// appearing twice is not expected, but a loop that handles it
+				// costs nothing and a loop that does not leaves half a bug.
+				for (int i = count_in_order - 1; i >= 0; i--)
+				{
+					auto entry = bridge::CallBuiltin("array_get",
+						{ *order, RValue(static_cast<double>(i)) });
+
+					if (!entry || entry->m_Kind != VALUE_STRING ||
+						!entry->ToCString())
+						continue;
+
+					if (type != entry->ToCString())
+						continue;
+
+					if (bridge::CallBuiltin("array_delete",
+							{ *order, RValue(static_cast<double>(i)),
+							  RValue(1.0) }))
+					{
+						LogInfo("removed the opponent's \"%s\" from the roster "
+							"ordering at index %d - it is their dude type, not "
+							"ours, and the end-of-round scoreboard walks this "
+							"list", type.c_str(), i);
+					}
+					else
+					{
+						LogWarn("could not remove \"%s\" from the roster "
+							"ordering. The round will abort at the victory "
+							"screen.", type.c_str());
+					}
+				}
+			}
 		}
 
 		// Spawn one unit of the opponent's army, as itself.
@@ -2770,6 +3499,57 @@ namespace hmd::roster
 				ForgetGeneratedRecord(key);
 				return false;
 			}
+
+			// TAKE IT OUT OF THE PLAYER'S ROSTER.
+			//
+			// dude_generate registers into global.DUDES. Correct for a dude,
+			// wrong for this one: it is the opponent's army spawned as an
+			// enemy, and it has no business in the local roster.
+			//
+			// The first working duel ended here:
+			//
+			//     I32 argument is undefined
+			//     gml_Script_endscreen_unit_frame:5
+			//     gml_Script_animals_outcome_frame:128
+			//     gml_Script_victory_ui_spawn:60
+			//
+			// NUM_DUDES_ACTIVE was corrected after that injection and the DUDES
+			// ENTRIES WERE NOT. Same bug as the two before it, third time: on
+			// this build every registry entry has a counter, and fixing one
+			// without the other only moves where it fails. A wrong counter
+			// froze the round; a wrong registry aborts the victory screen.
+			//
+			// Removed AFTER enemy_spawn rather than before, deliberately. The
+			// spawn is measured working with the entry present, so this is the
+			// smaller departure from the path known to work. enemy_spawn reads
+			// ANIMALS, which is untouched here.
+			RegistryRemove("DUDES", key);
+
+			// DUDES_ACTIVE is the second half of the same registry, and leaving
+			// it was the fourth instance of the rule above rather than a new
+			// bug. Measured at 19:58:12 and again at 19:58:18, mid-fight and
+			// just before the round resolved:
+			//
+			//     FOUND: global.ANIMALS["n4z"]           the injected record
+			//     FOUND: global.ANIMALS_CONSCIOUS["n4z"]
+			//     FOUND: global.DUDES_ACTIVE["n4z"] = TRUE
+			//     (global.DUDES["n4z"] absent - removed on the line above)
+			//
+			// A key flagged active in one table with no record in the other is
+			// exactly the undefined lookup scoreboard_data_set:37 aborts on.
+			RegistryRemove("DUDES_ACTIVE", key);
+
+			// Removing DUDES_ACTIVE cleared it from the probe's hit list and the
+			// crash stayed, which is how global.DUDE_IDS was found: the array
+			// scan saw an id-keyed list the struct-only search could not. Same
+			// removal, one structure over.
+			RemoveKeyFromIdArray("DUDE_IDS", key);
+
+			// DUDE_IDS_BY_TYPE indexes the same ids by type, and clearing the
+			// flat list did not touch it. It is the last one found by search:
+			// the deep pass saw it at global.DUDE_IDS_BY_TYPE.basic[1] on a
+			// victory screen where every other pass reported the id gone.
+			RemoveKeyFromTypeIndexedArrays("DUDE_IDS_BY_TYPE", key);
 
 			g_Injected.push_back({ key, spawned });
 			return true;
@@ -3524,6 +4304,26 @@ namespace hmd::roster
 			{ "hmd_obs_animals_clear",      "gml_Script_animals_clear",      nullptr },
 			{ "hmd_obs_hp_set",             "gml_Script_combatant_hp_set",   nullptr },
 			{ "hmd_obs_hp_change",          "gml_Script_combatant_hp_change", nullptr },
+
+			// The victory screen, which is where the first working duel died:
+			//
+			//     I32 argument is undefined
+			//     gml_Script_endscreen_unit_frame:5
+			//     gml_Script_animals_outcome_frame:128
+			//     gml_Script_victory_ui_spawn:60
+			//
+			// Two candidate causes and this log cannot separate them. Either the
+			// end screen walked leftover records the mod should have removed, or
+			// it cannot render a DUDE-typed record as an enemy unit at all - the
+			// second would be a real limit on the whole approach rather than a
+			// bug in the mod.
+			//
+			// These three observers print what each is called with, so the next
+			// crash names its own argument instead of being guessed at. They only
+			// watch; nothing here changes what the game does.
+			{ "hmd_obs_victory_ui",         "gml_Script_victory_ui_spawn",     nullptr },
+			{ "hmd_obs_outcome_frame",      "gml_Script_animals_outcome_frame", nullptr },
+			{ "hmd_obs_unit_frame",         "gml_Script_endscreen_unit_frame",  nullptr },
 		};
 
 		// One detour body per observer. They cannot share one function because a
@@ -3714,6 +4514,18 @@ namespace hmd::roster
 		g_SpawnObservers[10].trampoline = hooks::Install(Module,
 			g_SpawnObservers[10].hook_id, g_SpawnObservers[10].script,
 			&SpawnObserverDetour<10>);
+
+		g_SpawnObservers[11].trampoline = hooks::Install(Module,
+			g_SpawnObservers[11].hook_id, g_SpawnObservers[11].script,
+			&SpawnObserverDetour<11>);
+
+		g_SpawnObservers[12].trampoline = hooks::Install(Module,
+			g_SpawnObservers[12].hook_id, g_SpawnObservers[12].script,
+			&SpawnObserverDetour<12>);
+
+		g_SpawnObservers[13].trampoline = hooks::Install(Module,
+			g_SpawnObservers[13].hook_id, g_SpawnObservers[13].script,
+			&SpawnObserverDetour<13>);
 
 		int installed = 0;
 		for (const SpawnObserver& observer : g_SpawnObservers)
@@ -5129,6 +5941,64 @@ namespace hmd::roster
 			return 0;
 		}
 
+		// WHICH DUDE TYPES THIS RUN ACTUALLY HAS.
+		//
+		// `dude_generate` is not a pure factory. It registers into global.DUDES
+		// and then calls roster_order_refresh, which is the player's roster
+		// ordering - and that aborted the first solo duel:
+		//
+		//     I32 argument is undefined
+		//     gml_Script_roster_order_refresh:18
+		//     gml_Script_dude_generate:136
+		//
+		// The same call had succeeded twice before, both times on a type the
+		// local run already had. The working theory is that refreshing the
+		// ordering for a type this run's roster has never held resolves to
+		// undefined and aborts on the conversion.
+		//
+		// That theory is NOT confirmed - the roster at the moment of the crash
+		// was not logged, which is why it is being logged now. Both the local
+		// roster and the requested types go to the log on every injection, so
+		// the next one either confirms this or rules it out.
+		//
+		// Meanwhile an unknown type is SKIPPED rather than generated. A duel
+		// that spawns fewer units than the peer sent is a worse duel; a duel
+		// that ends the process is not a duel.
+		std::vector<std::string> local_types;
+		{
+			json::Value local;
+			if (json::Parse(CaptureGameNativeExport(), local) && local.IsObject())
+			{
+				for (const auto& [type, count] : local["dudes"].Members())
+					local_types.push_back(type);
+
+				for (const json::Value& entry : local["roster_order"].Items())
+				{
+					const std::string name = entry.AsString();
+
+					if (!name.empty() && std::find(local_types.begin(),
+							local_types.end(), name) == local_types.end())
+						local_types.push_back(name);
+				}
+			}
+		}
+
+		if (local_types.empty())
+		{
+			LogWarn("this run's own dude types could not be read, so an "
+				"incoming type cannot be checked against them. Spawning "
+				"anyway - if the game stops inside dude_generate, that is the "
+				"roster_order_refresh abort and the type was the cause.");
+		}
+		else
+		{
+			std::string listed;
+			for (const std::string& type : local_types)
+				listed += (listed.empty() ? "" : ", ") + type;
+
+			LogInfo("this run's dude types: %s", listed.c_str());
+		}
+
 		// Read once, before anything is generated, and reused for every unit.
 		// Each call to this generates a throwaway enemy record, so doing it per
 		// unit would be a registry churn for two values that do not vary.
@@ -5153,11 +6023,42 @@ namespace hmd::roster
 		int spawned = 0;
 		size_t position = 0;
 
+		int unknown_types = 0;
+
 		for (const auto& [type, count] : army.Members())
 		{
 			const double raw = count.AsNumber();
 			if (!std::isfinite(raw) || raw <= 0.0)
 				continue;
+
+			// An unknown type is now ATTEMPTED and announced, not skipped.
+			//
+			// The skip was added on the theory that generating a dude type the
+			// local roster has never held is what aborted inside
+			// roster_order_refresh. That theory is dead: the same call was
+			// measured working at the start of a battle and failing partway
+			// through one, so the cause was WHEN it was called, not WHAT was
+			// asked for.
+			//
+			// Leaving the skip in would be worse than useless in a real duel -
+			// it silently drops whatever the opponent has that you do not,
+			// which is most of an interesting army. So the question gets asked
+			// properly instead, and this line is what makes the answer legible
+			// if it goes badly.
+			const bool unknown_type = !local_types.empty() &&
+				std::find(local_types.begin(), local_types.end(), type) ==
+					local_types.end();
+
+			if (unknown_type)
+			{
+				LogWarn("\"%s\" is not a type this run's roster holds, and it "
+					"is being generated anyway. If the game stops here inside "
+					"roster_order_refresh, the type DOES matter after all and "
+					"the skip belongs back in - see the note above this line.",
+					type.c_str());
+
+				unknown_types++;
+			}
 
 			// Bounded per type. A peer is not trusted to size our arena, and a
 			// count that arrives absurd should cost a small wave rather than a
@@ -5176,13 +6077,110 @@ namespace hmd::roster
 			}
 		}
 
-		// The opponent's army must count as enemies and NOT as our dudes.
+		// REBUILD THE ROSTER ORDERING WITHOUT THE OPPONENT'S TYPES.
 		//
-		// enemy_spawn on a dude record increments both counters - measured
-		// 13:43:46, NUM_ENEMIES_ACTIVE 10 -> 11 beside NUM_DUDES_ACTIVE 1 -> 2.
-		// The enemy count is what makes the round wait for the unit and is
-		// wanted. The dude count is not: it is the local player's roster, the
-		// victory screen reads it, and leaving it inflated ends the round in
+		// This is the end-screen crash, and the tester named the area before
+		// the log did - `quantum_dude_summon_echo` and `quantum_echo_cast` are
+		// real routines, and so is `dude_type_scoreboard_row`.
+		//
+		// `dude_generate(type)` calls `roster_order_refresh`, which adds that
+		// type to the player's roster ORDERING. SpawnOneInjectedUnit then
+		// removes the record from `global.DUDES` - but nothing removes the
+		// type from the ordering, so the ordering names a dude type the roster
+		// no longer has anything behind.
+		//
+		// The scoreboard is built per dude TYPE - `dude_type_scoreboard_row`,
+		// `dude_type_scoreboard_breakdown`, `dudes_scoreboard_frame` - so at
+		// the end of the round it walks that ordering, reaches the opponent's
+		// type, finds nothing, and aborts:
+		//
+		//     I32 argument is undefined
+		//     gml_Script_scoreboard_data_set:37
+		//     gml_Script_victory_ui_spawn:9
+		//
+		// Calling the game's own refresh again rebuilds the ordering from what
+		// DUDES actually holds now. It is the same routine dude_generate just
+		// called successfully moments earlier, with one fewer entry to find,
+		// which is why it is a low-risk call at this point specifically.
+		//
+		// CALLING roster_order_refresh HERE IS FATAL. Measured 16:16:46:
+		//
+		//     enemy_spawn("dzw", ...) -> ref        the unit spawned fine
+		//     I32 argument is undefined
+		//     gml_Script_roster_order_refresh:18
+		//     - 0                                   <- no GML caller: this call
+		//
+		// The `- 0` is the whole finding. Nothing in the game asked for that
+		// refresh; the mod did, and it aborted on its own.
+		//
+		// And that CONFIRMS the mechanism rather than refuting it. :18 walks
+		// the ordering and looks each type up. By the time the mod called it,
+		// "quantum" was in the ordering and its record had already been taken
+		// out of DUDES - which is precisely the corrupt state the end-of-round
+		// scoreboard was aborting on. The refresh is not a repair for that
+		// state; it is another victim of it.
+		//
+		// So the ordering has to be edited directly, below.
+		RemoveForeignTypesFromRosterOrder(army, local_types);
+
+		// THE COUNTER MODEL, CORRECTED. This was wrong for three sessions.
+		//
+		// It was recorded as "enemy_spawn on a dude record increments both
+		// counters", from the probe at 13:43:46 which saw NUM_ENEMIES_ACTIVE
+		// 10 -> 11 and NUM_DUDES_ACTIVE 1 -> 2 across a block that also
+		// generated a throwaway enemy control. Both movements were attributed
+		// to the spawn. Only one of them was.
+		//
+		// 15:48:49 separated them, because the wave had just been cleared to a
+		// known 0:
+		//
+		//     after ClearDefaultEnemyWave        NUM_ENEMIES_ACTIVE = 0
+		//     after ReadEnemyMarkers             NUM_ENEMIES_ACTIVE = 1  <- control
+		//     after spawning one dude-as-enemy   NUM_ENEMIES_ACTIVE = 1  <- unchanged
+		//                                        NUM_DUDES_ACTIVE  1 -> 2
+		//
+		// So the counters follow the GENERATOR, not the spawn and not
+		// combatant_type:
+		//
+		//     animal_generate(type)   -> +1 NUM_ENEMIES_ACTIVE
+		//     dude_generate(type)     -> +1 NUM_DUDES_ACTIVE, and a roster refresh
+		//     enemy_spawn(key, x, y)  -> an instance, and no counter at all
+		//
+		// The consequence is that an injected opponent counts as one of OUR
+		// dudes and not as an enemy - the exact opposite of what a duel needs.
+		// The first duels appeared to work because the leaked control record
+		// held NUM_ENEMIES_ACTIVE at 1 and accidentally stood in for the unit
+		// that should have been counted.
+		//
+		// So both counters are now set deliberately: the dude count back to
+		// what it was, and the enemy count up by the number actually spawned.
+		if (g_EnemiesBeforeInjection >= 0 && spawned > 0)
+		{
+			const int wanted = g_EnemiesBeforeInjection + spawned;
+			const int now = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
+
+			if (now != wanted)
+			{
+				LogInfo("the injected units do not raise NUM_ENEMIES_ACTIVE on "
+					"their own (it reads %d) - setting it to %d so the round "
+					"waits for them", now, wanted);
+
+				RestoreGlobalCount("NUM_ENEMIES_ACTIVE", wanted);
+
+				const int settled = ReadGlobalCount("NUM_ENEMIES_ACTIVE");
+
+				if (settled != wanted)
+				{
+					LogError("NUM_ENEMIES_ACTIVE IS %d AND SHOULD BE %d. The "
+						"round will end early or not at all - restart the run.",
+						settled, wanted);
+				}
+			}
+		}
+
+		// The opponent's army must not count as our dudes. It is the local
+		// player's roster, the victory screen reads it, and leaving it inflated
+		// ends the round in
 		//
 		//     I32 argument is undefined
 		//     gml_Script_scoreboard_data_set:37
@@ -5222,6 +6220,10 @@ namespace hmd::roster
 
 		if (spawned == 0)
 			LogError("not one unit of the opponent's army could be spawned");
+		else if (unknown_types > 0)
+			LogInfo("%d type(s) this run has never held were generated without "
+				"incident - the roster_order_refresh abort was about timing, "
+				"not type, and the skip is correctly gone", unknown_types);
 
 		return spawned;
 	}

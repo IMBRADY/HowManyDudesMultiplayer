@@ -105,4 +105,39 @@ namespace hmd::match
 
 	// Log what the duel machinery resolved to.
 	void Report();
+
+	// -----------------------------------------------------------------------
+	// Solo duel - the duel path with the network taken out
+	// -----------------------------------------------------------------------
+	//
+	// Fights a synthetic army built from a config string instead of one that
+	// arrived from a peer. Everything after that point is the REAL path:
+	// ClearDefaultEnemyWave, InjectOpponentArmy, SpawnOneInjectedUnit, both
+	// counter corrections, EvaluateBattle, ApplyOutcome, RemoveInjectedWave.
+	// Only the socket is absent.
+	//
+	// This exists because every duel question so far has cost a two-machine
+	// session to ask, and none of them was actually about the network. The
+	// project's own first process lesson says to build this before the
+	// two-player test rather than after it; this is that, late.
+	//
+	// TURNING IT OFF: set `solo_duel = false` in the ini, which is the default.
+	// The hotkey then declines with a message and nothing else in the mod
+	// behaves differently - every solo-specific branch is behind
+	// SoloDuelEnabled() or the per-duel active flag, and a real duel is
+	// refused while one is running rather than being silently altered.
+	void SetSoloDuel(bool Enabled, const std::string& Army);
+
+	// Whether the ini turned it on. False in ordinary multiplayer use.
+	bool SoloDuelEnabled();
+
+	// True only between the start of a solo duel and its resolution. This is
+	// what makes the peer-result wait and the result broadcast fall away, and
+	// it is cleared on every exit path including the failure ones.
+	bool SoloDuelActive();
+
+	// Begin one. Declines, with a logged reason, if solo duels are off, if a
+	// peer is connected, if the player is not in a live round, or if a duel of
+	// either kind is already in progress.
+	void StartSoloDuel();
 }
